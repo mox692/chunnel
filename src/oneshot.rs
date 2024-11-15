@@ -1,10 +1,11 @@
 use crate::loom_wrapper::UnsafeCell;
+use crate::loom_wrapper::Arc;
+use crate::loom_wrapper::AtomicU8;
 use std::{
     future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
     rc::Rc,
-    sync::{atomic::AtomicU8, Arc},
     task::{Poll, Waker},
 };
 

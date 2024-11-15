@@ -26,3 +26,8 @@ impl<T> UnsafeCell<T> {
         f(self.0.get())
     }
 }
+
+#[cfg(not(all(loom, test)))]
+pub(crate) type AtomicU8 = std::sync::atomic::AtomicU8;
+#[cfg(all(loom, test))]
+pub(crate) type AtomicU8 = loom::sync::atomic::AtomicU8;

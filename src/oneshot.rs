@@ -1,5 +1,5 @@
+use crate::loom_wrapper::UnsafeCell;
 use std::{
-    cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
@@ -59,10 +59,12 @@ impl<T> Tx<T> {
             //
             // Since we don't allow the `Tx` to have multiple clones,
             // it's ok to just set the value without any syncronization.
-            let ptr = self.inner.bucket.get() as *mut T;
-            unsafe {
-                ptr.write(val);
-            }
+            // let ptr = self.inner.bucket.get() as *mut T;
+            self.inner.bucket.with_mut(|ptr| 
+                // SAFETY: todo
+                unsafe { (ptr as *mut T).write(val); }
+            );
+
 
             // Change the flag
             self.inner
@@ -79,8 +81,9 @@ impl<T> Rx<T> {
     pub fn try_recv(&self) -> Option<T> {
         if self.inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
             // read the value
-            let ptr = self.inner.bucket.get() as *const T;
-            let value = unsafe { ptr.read() };
+            let value = self.inner.bucket.with(|ptr| {
+                unsafe { (ptr as *const T).read()  }
+            });
 
             // set finalize flag
             self.inner
@@ -108,8 +111,9 @@ impl<T> Future for Rx<T> {
 
         if state == 1 {
             // Read the value
-            let ptr = self.inner.bucket.get() as *const T;
-            let value = unsafe { ptr.read() };
+            let value = self.inner.bucket.with(|ptr| {
+                unsafe { (ptr as *const T).read()  }
+            });
 
             // Set finalize flag
             self.inner
@@ -123,7 +127,9 @@ impl<T> Future for Rx<T> {
             let waker = cx.waker().clone();
             let this = self.get_mut();
             unsafe {
-                *this.inner.waker.get() = Some(waker);
+                this.inner.waker.with_mut(|old_waker| {
+                    *old_waker=  Some(waker)
+                })
             }
 
             Poll::Pending

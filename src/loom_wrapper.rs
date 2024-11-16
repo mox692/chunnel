@@ -28,6 +28,6 @@ impl<T> UnsafeCell<T> {
 }
 
 #[cfg(not(all(loom, test)))]
-pub(crate) type AtomicU8 = std::sync::atomic::AtomicU8;
+pub(crate) type AtomicUsize = std::sync::atomic::AtomicUsize;
 #[cfg(all(loom, test))]
-pub(crate) type AtomicU8 = loom::sync::atomic::AtomicU8;
+pub(crate) type AtomicUsize = loom::sync::atomic::AtomicUsize;

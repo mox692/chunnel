@@ -7,7 +7,7 @@ rust-version = "1.80"
 [dependencies]
 
 [target.'cfg(loom)'.dev-dependencies]
-loom = { version = "0.7" }
+loom = { version = "0.7", features = ["futures", "checkpoint"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

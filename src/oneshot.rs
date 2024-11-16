@@ -53,7 +53,12 @@ unsafe impl<T> Sync for Tx<T> {}
 pub struct Rx<T> {
     inner: Arc<Inner<T>>,
 
-    // To make `Tx` !Sync
+    // Since we provide `recv(&mut self)` and `try_recv(&self)` methods,
+    // we want to make sure that there exists only one Rx that has
+    // exclusive owner ship of the innver value.
+    // So, we make `Rx` !Sync explicitly.
+    //
+    // (Note: If we remove `try_recv(&self)`, we could make Rx Sync.)
     _p: PhantomData<*const ()>,
 }
 

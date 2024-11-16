@@ -1,6 +1,8 @@
 use crate::loom_wrapper::Arc;
 use crate::loom_wrapper::AtomicUsize;
 use crate::loom_wrapper::UnsafeCell;
+use std::pin::Pin;
+use std::task::Context;
 use std::{
     future::Future,
     marker::PhantomData,
@@ -56,6 +58,9 @@ pub struct Rx<T> {
 }
 
 unsafe impl<T: Send> Send for Rx<T> {}
+
+/// Rx itself doesn't need to be !Unpin.
+impl<T> Unpin for Rx<T> {}
 
 impl<T> Tx<T> {
     pub fn send(&mut self, val: T) {
@@ -146,17 +151,14 @@ impl<T> Rx<T> {
 
     /// Async variant
     pub async fn recv(&mut self) -> Option<T> {
-        // TODO: stack pinning.
-        // After this recv call, users should not be able to
-        // move this Rx, so it's safe to pin itself on the stack.
-        let this = Box::pin(self);
-        this.await
+        // Since we use .await, we don't need to use Pin manually.
+        self.await
     }
 }
 
 impl<T> Future for Rx<T> {
     type Output = Option<T>;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
         let sender_set = state & SENDER_SET == SENDER_SET;
         let complete = state & COMPLETE == COMPLETE;

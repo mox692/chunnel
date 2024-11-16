@@ -120,6 +120,41 @@ impl<T> Tx<T> {
     }
 }
 
+impl<T> Drop for Tx<T> {
+    fn drop(&mut self) {
+        let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
+
+        if state & COMPLETE == COMPLETE || state & SENDER_SET == SENDER_SET {
+            return;
+        }
+
+        // We should mark this channel as COMPLETE.
+        // Try to update the internal state.
+
+        let mut cur = state;
+        while let Err(now) = self.inner.state.compare_exchange_weak(
+            cur,
+            cur | COMPLETE,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            // Receiver just start sleeping!
+            // Wakeup that receiver and continue to set the COMPLETE flag.
+
+            cur = now;
+
+            self.inner.waker.with_mut(|w| {
+                // SAFETY:
+                unsafe { w.as_ref() }
+                    .expect("Waker field should not be null")
+                    .as_ref()
+                    .expect("Waker should exist at this point")
+                    .wake_by_ref();
+            });
+        }
+    }
+}
+
 impl<T> Rx<T> {
     /// Sync variant
     pub fn try_recv(&self) -> Option<T> {
@@ -249,6 +284,21 @@ mod loom_test {
 
             block_on(async {
                 tx.send(42);
+            });
+
+            jh.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn sender_drop() {
+        loom::model(|| {
+            let (tx, mut rx) = channel::<()>();
+
+            drop(tx);
+
+            let jh = thread::spawn(move || {
+                block_on(async { assert!(rx.recv().await.is_none()) });
             });
 
             jh.join().unwrap();

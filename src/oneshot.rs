@@ -173,6 +173,7 @@ impl<T> Future for Rx<T> {
             let value = self
                 .inner
                 .bucket
+                // SAFETY: ptr should be initialized
                 .with(|ptr| unsafe { (ptr as *const T).read() });
 
             // Set COMPLETE flag
@@ -187,11 +188,10 @@ impl<T> Future for Rx<T> {
         // TODO: update the waker only if task has been changed.
         let waker = cx.waker().clone();
         let this = self.get_mut();
-        unsafe {
-            this.inner
-                .waker
-                .with_mut(|old_waker| *old_waker = Some(waker))
-        }
+
+        this.inner.waker.with_mut(|old_waker|
+                // SAFETY: At this point, Rx has exclusive owner ship for the waker field.
+                unsafe { *old_waker = Some(waker) });
 
         // Try to set the RECEIVER_WAIT flag
         let cur = state;
@@ -209,10 +209,10 @@ impl<T> Future for Rx<T> {
                 assert!(now & SENDER_SET == 1);
 
                 // Get the inner value
-                let value = this
-                    .inner
-                    .bucket
-                    .with(|ptr| unsafe { (ptr as *const T).read() });
+                let value = this.inner.bucket.with(|ptr| unsafe {
+                    // SAFETY: ptr should be initialized
+                    (ptr as *const T).read()
+                });
 
                 // Set COMPLETE flag
                 this.inner

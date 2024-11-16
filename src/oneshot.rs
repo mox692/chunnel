@@ -58,7 +58,7 @@ pub struct Rx<T> {
 unsafe impl<T: Send> Send for Rx<T> {}
 
 impl<T> Tx<T> {
-    pub fn send(&self, val: T) {
+    pub fn send(&mut self, val: T) {
         let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
 
         if state & SENDER_SET != 0 {
@@ -231,7 +231,7 @@ mod loom_test {
     #[test]
     fn recv() {
         loom::model(|| {
-            let (tx, mut rx) = channel();
+            let (mut tx, mut rx) = channel();
 
             let jh = thread::spawn(move || {
                 block_on(async {

@@ -114,35 +114,34 @@ impl<T> Rx<T> {
     /// Sync variant
     pub fn try_recv(&self) -> Option<T> {
         let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
-        let sender_set = state & SENDER_SET == 1;
-        let complete = state & COMPLETE == 1;
 
-        if sender_set && !complete {
-            // Try to update the state
-            let cur = state;
-            let next = COMPLETE;
+        // Check if the sender is set and the operation is not complete
+        if state & SENDER_SET != SENDER_SET || state & COMPLETE == COMPLETE {
+            return None;
+        }
 
-            let Ok(_) = self.inner.state.compare_exchange_weak(
-                cur,
-                next,
+        // Try to update the state
+        if self
+            .inner
+            .state
+            .compare_exchange_weak(
+                state,
+                COMPLETE,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
-            ) else {
-                // Another receiver just updates the inner value.
-                return None;
-            };
-
-            // Read the value
-            let value = self
-                .inner
-                .bucket
-                .with(|ptr| unsafe { (ptr as *const T).read() });
-
-            Some(value)
-        } else {
-            // Complete or not be sent yet.
-            None
+            )
+            .is_err()
+        {
+            return None;
         }
+
+        // Read the value
+        let value = self
+            .inner
+            .bucket
+            .with(|ptr| unsafe { (ptr as *const T).read() });
+
+        Some(value)
     }
 
     /// Async variant
@@ -159,8 +158,8 @@ impl<T> Future for Rx<T> {
     type Output = Option<T>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
-        let sender_set = state & SENDER_SET == 1;
-        let complete = state & COMPLETE == 1;
+        let sender_set = state & SENDER_SET == SENDER_SET;
+        let complete = state & COMPLETE == COMPLETE;
 
         if complete {
             return Poll::Ready(None);
@@ -179,46 +178,46 @@ impl<T> Future for Rx<T> {
                 .state
                 .store(COMPLETE, std::sync::atomic::Ordering::Release);
 
-            Poll::Ready(Some(value))
-        } else {
-            // Set the waker
-            // TODO: update the waker only if task has been changed.
-            let waker = cx.waker().clone();
-            let this = self.get_mut();
-            unsafe {
+            return Poll::Ready(Some(value));
+        }
+
+        // Set the waker
+        // TODO: update the waker only if task has been changed.
+        let waker = cx.waker().clone();
+        let this = self.get_mut();
+        unsafe {
+            this.inner
+                .waker
+                .with_mut(|old_waker| *old_waker = Some(waker))
+        }
+
+        // Try to set the RECEIVER_WAIT flag
+        let cur = state;
+        let next = state | RECEIVER_WAIT;
+        match this.inner.state.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => Poll::Pending,
+            Err(now) => {
+                // Sender has just updated the inner value!
+                // SENDER_SET should be set
+                assert!(now & SENDER_SET == 1);
+
+                // Get the inner value
+                let value = this
+                    .inner
+                    .bucket
+                    .with(|ptr| unsafe { (ptr as *const T).read() });
+
+                // Set COMPLETE flag
                 this.inner
-                    .waker
-                    .with_mut(|old_waker| *old_waker = Some(waker))
-            }
+                    .state
+                    .store(COMPLETE, std::sync::atomic::Ordering::Release);
 
-            // Try to set the RECEIVER_WAIT flag
-            let cur = state;
-            let next = state | RECEIVER_WAIT;
-            match this.inner.state.compare_exchange_weak(
-                cur,
-                next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => Poll::Pending,
-                Err(now) => {
-                    // Sender has just updated the inner value!
-                    // SENDER_SET should be set
-                    assert!(now & SENDER_SET == 1);
-
-                    // Get the inner value
-                    let value = this
-                        .inner
-                        .bucket
-                        .with(|ptr| unsafe { (ptr as *const T).read() });
-
-                    // Set COMPLETE flag
-                    this.inner
-                        .state
-                        .store(COMPLETE, std::sync::atomic::Ordering::Release);
-
-                    Poll::Ready(Some(value))
-                }
+                Poll::Ready(Some(value))
             }
         }
     }

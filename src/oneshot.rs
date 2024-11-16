@@ -19,7 +19,6 @@ pub fn channel<T>() -> (Tx<T>, Rx<T>) {
     });
     let tx = Tx {
         inner: inner.clone(),
-        _p: PhantomData,
     };
     let rx = Rx {
         inner: inner.clone(),
@@ -42,12 +41,13 @@ struct Inner<T> {
 /// Sender handle of the channel. This implements `Send` but not `Sync`.
 pub struct Tx<T> {
     inner: Arc<Inner<T>>,
-
-    // To make `Tx` !Sync
-    _p: PhantomData<*const ()>,
 }
 
 unsafe impl<T: Send> Send for Tx<T> {}
+
+// It's ok to share the &Tx<T> to multiple threads since there is no way
+// to access inner value for &Tx<T>.
+unsafe impl<T> Sync for Tx<T> {}
 
 /// Sender handle of the channel. This implements `Send` but not `Sync`.
 pub struct Rx<T> {

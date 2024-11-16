@@ -5,7 +5,6 @@ use std::{
     future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
-    rc::Rc,
     task::{Poll, Waker},
 };
 
@@ -43,7 +42,7 @@ pub struct Tx<T> {
     inner: Arc<Inner<T>>,
 
     // To make `Tx` !Sync
-    _p: PhantomData<Rc<()>>,
+    _p: PhantomData<*const ()>,
 }
 
 unsafe impl<T: Send> Send for Tx<T> {}
@@ -53,7 +52,7 @@ pub struct Rx<T> {
     inner: Arc<Inner<T>>,
 
     // To make `Tx` !Sync
-    _p: PhantomData<Rc<()>>,
+    _p: PhantomData<*const ()>,
 }
 
 unsafe impl<T: Send> Send for Rx<T> {}

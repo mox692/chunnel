@@ -224,4 +224,29 @@ impl<T> Future for Rx<T> {
         }
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_test {
+    use super::*;
+    use loom::{future::block_on, thread};
+
+    #[test]
+    fn recv() {
+        loom::model(|| {
+            let (tx, mut rx) = channel();
+
+            let jh = thread::spawn(move || {
+                block_on(async {
+                    let res = rx.recv().await.unwrap();
+                    assert_eq!(res, 42);
+                });
+            });
+
+            block_on(async {
+                tx.send(42);
+            });
+
+            jh.join().unwrap();
+        });
+    }
 }

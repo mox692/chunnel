@@ -1,6 +1,6 @@
-use crate::loom_wrapper::UnsafeCell;
 use crate::loom_wrapper::Arc;
-use crate::loom_wrapper::AtomicU8;
+use crate::loom_wrapper::AtomicUsize;
+use crate::loom_wrapper::UnsafeCell;
 use std::{
     future::Future,
     marker::PhantomData,
@@ -12,7 +12,7 @@ use std::{
 /// Oneshot channel that can send or receive a value only once.
 pub fn channel<T>() -> (Tx<T>, Rx<T>) {
     let inner = Arc::new(Inner {
-        state: AtomicU8::new(0),
+        state: AtomicUsize::new(0),
         bucket: UnsafeCell::new(MaybeUninit::uninit()),
         waker: UnsafeCell::new(None),
     });
@@ -27,8 +27,13 @@ pub fn channel<T>() -> (Tx<T>, Rx<T>) {
     (tx, rx)
 }
 
+// Inner states
+const SENDER_SET: usize = 0b001;
+const RECEIVER_WAIT: usize = 0b010;
+const COMPLETE: usize = 0b100;
+
 struct Inner<T> {
-    state: AtomicU8,
+    state: AtomicUsize,
     bucket: UnsafeCell<MaybeUninit<T>>,
     waker: UnsafeCell<Option<Waker>>,
 }
@@ -55,24 +60,53 @@ unsafe impl<T: Send> Send for Rx<T> {}
 
 impl<T> Tx<T> {
     pub fn send(&self, val: T) {
-        if self.inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            // Set a value.
-            //
-            // Since we don't allow the `Tx` to have multiple clones,
-            // it's ok to just set the value without any syncronization.
-            // let ptr = self.inner.bucket.get() as *mut T;
-            self.inner.bucket.with_mut(|ptr| 
-                // SAFETY: todo
-                unsafe { (ptr as *mut T).write(val); }
-            );
+        let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
 
-
-            // Change the flag
-            self.inner
-                .state
-                .store(1, std::sync::atomic::Ordering::Release);
-        } else {
+        if state & SENDER_SET != 0 {
             // We've already sent a value to this channel, so do nothing.
+            return;
+        }
+
+        // Set a value.
+        //
+        // Since we don't allow the `Tx` to have multiple clones,
+        // it's ok to just set the value without any syncronization.
+        // let ptr = self.inner.bucket.get() as *mut T;
+        self.inner.bucket.with_mut(|ptr| {
+            // SAFETY: todo
+            unsafe {
+                (ptr as *mut T).write(val);
+            }
+        });
+
+        // Change the flag.
+
+        let mut cur = state;
+        let mut next = state | SENDER_SET;
+        while let Err(now) = self.inner.state.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            // Receiver has just updated the inner value, so try again.
+
+            assert!(now & SENDER_SET == 0);
+
+            cur = now;
+            next = cur | SENDER_SET;
+        }
+
+        if next & RECEIVER_WAIT == RECEIVER_WAIT {
+            // wakeup the receiver
+            self.inner.waker.with_mut(|w| {
+                // SAFETY:
+                unsafe { w.as_ref() }
+                    .expect("Waker field should not be null")
+                    .as_ref()
+                    .expect("Waker should exist at this point")
+                    .wake_by_ref();
+            });
         }
     }
 }
@@ -80,26 +114,43 @@ impl<T> Tx<T> {
 impl<T> Rx<T> {
     /// Sync variant
     pub fn try_recv(&self) -> Option<T> {
-        if self.inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
-            // read the value
-            let value = self.inner.bucket.with(|ptr| {
-                unsafe { (ptr as *const T).read()  }
-            });
+        let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
+        let sender_set = state & SENDER_SET == 1;
+        let complete = state & COMPLETE == 1;
 
-            // set finalize flag
-            self.inner
-                .state
-                .store(2, std::sync::atomic::Ordering::Release);
+        if sender_set && !complete {
+            // Try to update the state
+            let cur = state;
+            let next = COMPLETE;
+
+            let Ok(_) = self.inner.state.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) else {
+                // Another receiver just updates the inner value.
+                return None;
+            };
+
+            // Read the value
+            let value = self
+                .inner
+                .bucket
+                .with(|ptr| unsafe { (ptr as *const T).read() });
 
             Some(value)
         } else {
-            // complete or not set yet.
+            // Complete or not be sent yet.
             None
         }
     }
 
     /// Async variant
     pub async fn recv(&mut self) -> Option<T> {
+        // TODO: stack pinning.
+        // After this recv call, users should not be able to
+        // move this Rx, so it's safe to pin itself on the stack.
         let this = Box::pin(self);
         this.await
     }
@@ -109,36 +160,68 @@ impl<T> Future for Rx<T> {
     type Output = Option<T>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let state = self.inner.state.load(std::sync::atomic::Ordering::Acquire);
+        let sender_set = state & SENDER_SET == 1;
+        let complete = state & COMPLETE == 1;
 
-        if state == 1 {
-            // Read the value
-            let value = self.inner.bucket.with(|ptr| {
-                unsafe { (ptr as *const T).read()  }
-            });
+        if complete {
+            return Poll::Ready(None);
+        }
 
-            // Set finalize flag
+        if sender_set {
+            // Since we have a exclusive ownership of the receiver,
+            // we don't have to perform CAS loop.
+            let value = self
+                .inner
+                .bucket
+                .with(|ptr| unsafe { (ptr as *const T).read() });
+
+            // Set COMPLETE flag
             self.inner
                 .state
-                .store(2, std::sync::atomic::Ordering::Release);
+                .store(COMPLETE, std::sync::atomic::Ordering::Release);
 
             Poll::Ready(Some(value))
-        } else if state == 0 {
+        } else {
             // Set the waker
             // TODO: update the waker only if task has been changed.
             let waker = cx.waker().clone();
             let this = self.get_mut();
             unsafe {
-                this.inner.waker.with_mut(|old_waker| {
-                    *old_waker=  Some(waker)
-                })
+                this.inner
+                    .waker
+                    .with_mut(|old_waker| *old_waker = Some(waker))
             }
 
-            Poll::Pending
-        } else if state == 2 {
-            // We've already received the value before.
-            Poll::Ready(None)
-        } else {
-            panic!("unreachable")
+            // Try to set the RECEIVER_WAIT flag
+            let cur = state;
+            let next = state | RECEIVER_WAIT;
+            match this.inner.state.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => Poll::Pending,
+                Err(now) => {
+                    // Sender has just updated the inner value!
+                    // SENDER_SET should be set
+                    assert!(now & SENDER_SET == 1);
+
+                    // Get the inner value
+                    let value = this
+                        .inner
+                        .bucket
+                        .with(|ptr| unsafe { (ptr as *const T).read() });
+
+                    // Set COMPLETE flag
+                    this.inner
+                        .state
+                        .store(COMPLETE, std::sync::atomic::Ordering::Release);
+
+                    Poll::Ready(Some(value))
+                }
+            }
         }
     }
+}
 }

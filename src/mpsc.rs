@@ -25,7 +25,7 @@ fn channel<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
     let tx = Tx {
         inner: inner.clone(),
     };
-    let rx = Rx { inner: inner };
+    let rx = Rx { inner };
 
     (tx, rx)
 }
@@ -39,7 +39,7 @@ struct Rx<T, const N: usize> {
 }
 
 impl<T, const N: usize> Tx<T, N> {
-    fn send(self, v: T) {
+    fn send(&self, v: T) {
         let guard = self.inner.lock().unwrap();
         let head = guard.head;
 
@@ -54,7 +54,9 @@ impl<T, const N: usize> Tx<T, N> {
 }
 
 impl<T, const N: usize> Rx<T, N> {
-    fn recv() {}
+    async fn recv(&mut self) -> Option<T> {
+        None
+    }
 }
 
 impl<T, const N: usize> Clone for Tx<T, N> {

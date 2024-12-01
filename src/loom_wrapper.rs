@@ -8,9 +8,11 @@ pub(crate) type Arc<T> = std::sync::Arc<T>;
 #[cfg(all(loom, test))]
 pub(crate) type Arc<T> = loom::sync::Arc<T>;
 
+#[cfg(not(all(loom, test)))]
 #[derive(Debug)]
 pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
 
+#[cfg(not(all(loom, test)))]
 impl<T> UnsafeCell<T> {
     pub(crate) const fn new(data: T) -> UnsafeCell<T> {
         UnsafeCell(std::cell::UnsafeCell::new(data))
@@ -27,7 +29,15 @@ impl<T> UnsafeCell<T> {
     }
 }
 
+#[cfg(all(loom, test))]
+pub(crate) type UnsafeCell<T> = loom::cell::UnsafeCell<T>;
+
 #[cfg(not(all(loom, test)))]
 pub(crate) type AtomicUsize = std::sync::atomic::AtomicUsize;
 #[cfg(all(loom, test))]
 pub(crate) type AtomicUsize = loom::sync::atomic::AtomicUsize;
+
+#[cfg(not(all(loom, test)))]
+pub(crate) type AtomicBool = std::sync::atomic::AtomicBool;
+#[cfg(all(loom, test))]
+pub(crate) type AtomicBool = loom::sync::atomic::AtomicBool;

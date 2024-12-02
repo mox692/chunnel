@@ -6,8 +6,20 @@ rust-version = "1.80"
 
 [dependencies]
 
+[dev-dependencies]
+
+[target.'cfg(not(loom))'.dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+async-channel = "2.3.1"
+criterion = "0.5.1"
+
 [target.'cfg(loom)'.dev-dependencies]
 loom = { version = "0.7", features = ["futures", "checkpoint"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[[bench]]
+name = "mpmc"
+path = "benches/mpmc.rs"
+harness = false

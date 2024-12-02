@@ -13,7 +13,6 @@ use std::task::{Poll, Waker};
 ///  [ ]   -   [ ]   -   [ ]    -> ...
 ///  tail                head
 struct Inner<T, const N: usize> {
-    /// Should we add a specific drop implementation?
     bucket: [UnsafeCell<MaybeUninit<T>>; N],
 
     /// A place next sender will write to.
@@ -112,9 +111,18 @@ impl<T, const N: usize> Inner<T, N> {
 }
 
 impl<T, const N: usize> Drop for Inner<T, N> {
-    // TODO: ensure to call a drop for all element
+    // We have to manually drop the values that are not read by the receiver.
     fn drop(&mut self) {
-        for i in 0..N {}
+        let cur_tail = self.tail.load(SeqCst);
+        let cur_head = self.head.load(SeqCst);
+
+        let cur_tail_pos = self.get_buf_index(cur_tail);
+        let cur_head_pos = self.get_buf_index(cur_head);
+
+        for i in cur_tail_pos..cur_head_pos {
+            let v = unsafe { (self.bucket.as_ptr() as *mut T).add(i).read() };
+            drop(v);
+        }
     }
 }
 
@@ -139,6 +147,7 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
 
 // TODO: check
 unsafe impl<T: Send, const N: usize> Send for Tx<T, N> {}
+unsafe impl<T: Send, const N: usize> Sync for Tx<T, N> {}
 unsafe impl<T: Send, const N: usize> Send for Rx<T, N> {}
 
 #[derive(PartialEq, Eq, Debug)]
@@ -404,6 +413,8 @@ impl<T, const N: usize> Drop for Rx<T, N> {
 
 #[cfg(all(test, loom))]
 mod loom_test {
+    use std::sync::mpsc::TryRecvError;
+
     use super::*;
     use loom::thread;
 
@@ -484,6 +495,34 @@ mod loom_test {
 
             tx.try_send(43).unwrap();
             assert_eq!(rx.try_recv(), Ok(43));
+        });
+    }
+
+    #[test]
+    fn inner_drop() {
+        loom::model(|| {
+            struct A(std::sync::mpsc::Sender<()>);
+            impl Drop for A {
+                fn drop(&mut self) {
+                    self.0.send(()).unwrap();
+                }
+            }
+
+            let (sender, receiver) = std::sync::mpsc::channel::<()>();
+
+            {
+                let a1 = A(sender.clone());
+                let a2 = A(sender);
+
+                let (tx, _rx) = bounded::<A, 10>();
+
+                tx.try_send(a1).unwrap();
+                tx.try_send(a2).unwrap();
+            }
+
+            assert_eq!(receiver.try_recv().unwrap(), ());
+            assert_eq!(receiver.try_recv().unwrap(), ());
+            assert_eq!(receiver.try_recv(), Err(TryRecvError::Disconnected));
         });
     }
 }

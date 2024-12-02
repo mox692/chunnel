@@ -13,7 +13,8 @@ use std::task::{Poll, Waker};
 ///  [ ]   -   [ ]   -   [ ]    -> ...
 ///  tail                head
 struct Inner<T, const N: usize> {
-    bucket: UnsafeCell<MaybeUninit<[T; N]>>,
+    /// Should we add a specific drop implementation?
+    bucket: [UnsafeCell<MaybeUninit<T>>; N],
 
     /// A place next sender will write to.
     /// closed == 1 if all tx are dropped
@@ -38,18 +39,14 @@ struct Inner<T, const N: usize> {
 impl<T, const N: usize> Inner<T, N> {
     fn write_at(&self, index: usize, v: T) {
         debug_assert!(index < N);
-        self.bucket.with_mut(|bucket| {
-            // SAFETY: todo
-            unsafe { ({ bucket.offset(index as isize) } as *mut T).write(v) };
-        })
+        // SAFETY: todo
+        unsafe { (self.bucket.as_ptr() as *mut T).add(index).write(v) };
     }
 
     fn read_at(&self, index: usize) -> T {
         debug_assert!(index < N);
-        self.bucket.with_mut(|bucket| {
-            // SAFETY: todo
-            unsafe { ({ bucket.offset(index as isize) } as *mut T).read() }
-        })
+        // SAFETY: todo
+        unsafe { (self.bucket.as_ptr() as *mut T).add(index).read() }
     }
 
     // If passed a Rx packed value, then check if all rxes are closed (i.e. dropped )or not.
@@ -114,10 +111,17 @@ impl<T, const N: usize> Inner<T, N> {
     }
 }
 
+impl<T, const N: usize> Drop for Inner<T, N> {
+    // TODO: ensure to call a drop for all element
+    fn drop(&mut self) {
+        for i in 0..N {}
+    }
+}
+
 /// docs
 pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
     let inner = Arc::new(Inner {
-        bucket: UnsafeCell::new(MaybeUninit::uninit()),
+        bucket: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
         head: AtomicUsize::new(0),
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),
@@ -466,4 +470,20 @@ mod loom_test {
         });
     }
 
+    #[test]
+    fn send_multiple_value() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 10>();
+            let rx2 = rx.clone();
+            tx.try_send(42).unwrap();
+            let jh = thread::spawn(move || {
+                assert_eq!(rx2.try_recv(), Ok(42));
+            });
+            jh.join().unwrap();
+            assert_eq!(rx.try_recv(), Err(RxError::NoValueToRead));
+
+            tx.try_send(43).unwrap();
+            assert_eq!(rx.try_recv(), Ok(43));
+        });
+    }
 }

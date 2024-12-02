@@ -326,7 +326,6 @@ impl<T, const N: usize> Rx<T, N> {
 
 impl<T, const N: usize> Clone for Tx<T, N> {
     fn clone(&self) -> Self {
-        // TODO: handle overflow
         self.inner.tx_count.fetch_add(1, SeqCst);
         let inner = self.inner.clone();
         Tx { inner }
@@ -364,7 +363,9 @@ impl<T, const N: usize> Drop for Tx<T, N> {
 
 impl<T, const N: usize> Clone for Rx<T, N> {
     fn clone(&self) -> Self {
-        todo!()
+        self.inner.rx_count.fetch_add(1, SeqCst);
+        let inner = self.inner.clone();
+        Rx { inner }
     }
 }
 
@@ -441,4 +442,28 @@ mod loom_test {
             assert_eq!(rx.try_recv(), Err(RxError::Closed))
         });
     }
+
+    #[test]
+    fn clone_rx() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 10>();
+            let rx2 = rx.clone();
+            drop(rx);
+            tx.try_send(42).unwrap();
+            assert_eq!(rx2.try_recv(), Ok(42));
+        });
+    }
+
+    #[test]
+    fn clone_drop_rx() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 10>();
+            let rx2 = rx.clone();
+            let jh = thread::spawn(move || drop(rx2));
+            tx.try_send(42).unwrap();
+            assert_eq!(rx.try_recv(), Ok(42));
+            jh.join().unwrap();
+        });
+    }
+
 }

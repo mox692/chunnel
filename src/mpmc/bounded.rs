@@ -38,13 +38,15 @@ struct Inner<T, const N: usize> {
 impl<T, const N: usize> Inner<T, N> {
     fn write_at(&self, index: usize, v: T) {
         debug_assert!(index < N);
-        // SAFETY: todo
+
+        // SAFETY: Index must not be out of range (not greater than N).
         unsafe { (self.bucket.as_ptr() as *mut T).add(index).write(v) };
     }
 
     fn read_at(&self, index: usize) -> T {
         debug_assert!(index < N);
-        // SAFETY: todo
+
+        // SAFETY: Index must not be out of range (not greater than N).
         unsafe { (self.bucket.as_ptr() as *mut T).add(index).read() }
     }
 
@@ -120,6 +122,7 @@ impl<T, const N: usize> Drop for Inner<T, N> {
         let cur_head_pos = self.get_buf_index(cur_head);
 
         for i in cur_tail_pos..cur_head_pos {
+            // SAFETY: Index must not be out of range (not greater than N).
             let v = unsafe { (self.bucket.as_ptr() as *mut T).add(i).read() };
             drop(v);
         }
@@ -145,10 +148,26 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
     (tx, rx)
 }
 
-// TODO: check
+/// SAFETY:
+/// `T` needs to be Send in order to make Tx<T, N> Send since otherwise
+/// we could send a non-Send value to another thread by using `Tx::send()`
+/// and `Rx::recv()`.
+///
+/// Whether T implements Sync or not does not matter because currently we don't
+/// provide a api that enables to send a `&T` to multiple threads.
 unsafe impl<T: Send, const N: usize> Send for Tx<T, N> {}
-unsafe impl<T: Send, const N: usize> Sync for Tx<T, N> {}
 unsafe impl<T: Send, const N: usize> Send for Rx<T, N> {}
+
+/// SAFETY:
+/// Since we provide `Tx::send(&self)` api and `Rx::recv(&self)` api, just having
+/// shared reference is enough for `Tx` or `Rx` to send a value to another thread.
+/// This means that a shared access to the `Tx` or `Rx` across multiple threads
+/// should be safe only when T implement Send.
+///
+/// Whether T implements Sync or not does not matter because currently we don't
+/// provide a api that enables to send a `&T` to multiple threads.
+unsafe impl<T: Send, const N: usize> Sync for Tx<T, N> {}
+unsafe impl<T: Send, const N: usize> Sync for Rx<T, N> {}
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum TxError {

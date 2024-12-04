@@ -88,18 +88,6 @@ impl<T, const N: usize> Inner<T, N> {
         }
     }
 
-    #[inline(always)]
-    fn cap(&self) -> usize {
-        N
-    }
-
-    /// input:  10|1|01101
-    /// output: 10|0|00000
-    fn get_lap(packed: usize) -> usize {
-        let one_lap = N.next_power_of_two();
-        packed & !(one_lap - 1)
-    }
-
     /// input:  10|1|01101
     /// output: 00|0|01101
     fn get_buf_index(&self, packed: usize) -> usize {
@@ -247,11 +235,82 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     let v = this.val.take().expect("inner value should not be None");
                     this.inner.inner.write_at(cur_head_pos, v);
 
+                    // If there is a waiting `Rx` task, then wake it up
+                    let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
+                    if guard.front().is_some() {
+                        let waker = guard.pop_front().unwrap();
+                        waker.wake();
+                    }
+                    drop(guard);
+
                     return Poll::Ready(Ok(()));
                 }
                 Err(now) => {
                     cur_head = now;
                 }
+            }
+        }
+    }
+}
+
+/// This struct is `Unpin`
+struct RxRef<'a, T, const N: usize> {
+    inner: &'a Rx<T, N>,
+}
+
+impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
+    type Output = Result<T, RxError>;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let mut cur_tail = self.inner.inner.tail.load(SeqCst);
+
+        loop {
+            let cur_tail_pos = self.inner.inner.get_buf_index(cur_tail);
+            let cur_head = self.inner.inner.head.load(SeqCst);
+
+            // Is there a value to read? Ignore the closed bit
+            if cur_head & !self.inner.inner.get_closed_bit()
+                == cur_tail & !self.inner.inner.get_closed_bit()
+            {
+                let waker = cx.waker().clone();
+                let mut guard = self.inner.inner.rx_wakers.lock().unwrap();
+                guard.push_back(waker);
+                drop(guard);
+
+                return Poll::Pending;
+            }
+
+            // There is a space to read!
+
+            let next_pos = if cur_tail_pos + 1 == N {
+                // next lap
+                (cur_tail_pos + self.inner.inner.one_lap()) & !(self.inner.inner.one_lap() - 1)
+            } else {
+                cur_tail_pos + 1
+            };
+
+            let next = self.inner.inner.pack_pos(next_pos, cur_tail);
+
+            match self
+                .inner
+                .inner
+                .tail
+                .compare_exchange_weak(cur_tail, next, SeqCst, SeqCst)
+            {
+                Ok(_) => {
+                    // read at cur_tail value! (not next)
+                    let res = self.inner.inner.read_at(cur_tail_pos);
+
+                    // If there is a waiting `Tx` task, then wake it up
+                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
+                    if guard.front().is_some() {
+                        let waker = guard.pop_front().unwrap();
+                        waker.wake();
+                    }
+                    drop(guard);
+
+                    return Poll::Ready(Ok(res));
+                }
+                Err(now) => cur_tail = now,
             }
         }
     }
@@ -305,6 +364,14 @@ impl<T, const N: usize> Tx<T, N> {
 
                     self.inner.write_at(index, v);
 
+                    // If there is a waiting `Rx` task, then wake it up
+                    let mut guard = self.inner.rx_wakers.lock().unwrap();
+                    if guard.front().is_some() {
+                        let waker = guard.pop_front().unwrap();
+                        waker.wake();
+                    }
+                    drop(guard);
+
                     return Ok(());
                 }
                 Err(now) => {
@@ -316,8 +383,9 @@ impl<T, const N: usize> Tx<T, N> {
 }
 
 impl<T, const N: usize> Rx<T, N> {
-    pub async fn recv(&self) -> Option<T> {
-        todo!()
+    pub async fn recv(&self) -> Result<T, RxError> {
+        let rx_ref = RxRef { inner: self };
+        rx_ref.await
     }
 
     /// Try to receive a value from the queue.
@@ -558,6 +626,21 @@ mod loom_test {
             assert_eq!(rx.try_recv(), Ok(1));
             assert_ready_ok!(task.poll());
             assert_eq!(rx.try_recv(), Ok(2));
+        });
+    }
+
+    #[test]
+    fn recv_wake_up() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 1>();
+
+            let mut rx_task = task::spawn(rx.recv());
+            assert_pending!(rx_task.poll());
+
+            let mut tx_task = task::spawn(tx.send(1));
+            assert_ready_ok!(tx_task.poll());
+
+            assert_ready_ok!(rx_task.poll());
         });
     }
 

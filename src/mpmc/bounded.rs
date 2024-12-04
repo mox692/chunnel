@@ -3,7 +3,6 @@
 use crate::loom_wrapper::{Arc, AtomicUsize, Mutex, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;
-use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::task::{Poll, Waker};
@@ -31,8 +30,11 @@ struct Inner<T, const N: usize> {
     /// The number of Rx
     rx_count: AtomicUsize,
 
-    /// todo
+    /// Wait list of `Tx`
     tx_wakers: Mutex<VecDeque<Waker>>,
+
+    /// Wait list of `Rx`
+    rx_wakers: Mutex<VecDeque<Waker>>,
 }
 
 impl<T, const N: usize> Inner<T, N> {
@@ -60,19 +62,11 @@ impl<T, const N: usize> Inner<T, N> {
     // Return true if there are no spaces to write to due to the slow read by Rx.
     #[inline(always)]
     fn is_full(&self, packed_head: usize, packed_tail: usize) -> bool {
-        let head_pos = self.get_buf_index(packed_head);
-        let tail_pos = self.get_buf_index(packed_tail);
+        // ignore closed bit.
+        let head = packed_head & !self.get_closed_bit();
+        let tail = packed_tail & !self.get_closed_bit();
 
-        if tail_pos <= head_pos {
-            if head_pos - tail_pos == N - 1 {
-                // head = N - 1, tail_pos = 0の時はfull
-                true
-            } else {
-                false
-            }
-        } else {
-            (packed_head + 1) - self.one_lap() == packed_tail
-        }
+        return (head - tail) == self.one_lap();
     }
 
     #[inline(always)]
@@ -131,6 +125,8 @@ impl<T, const N: usize> Drop for Inner<T, N> {
 
 /// docs
 pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
+    assert!(1 <= N, "Capacity must be greater than 1");
+
     let inner = Arc::new(Inner {
         bucket: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
         head: AtomicUsize::new(0),
@@ -138,6 +134,7 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
         tx_count: AtomicUsize::new(1),
         rx_count: AtomicUsize::new(1),
         tx_wakers: Mutex::new(VecDeque::new()),
+        rx_wakers: Mutex::new(VecDeque::new()),
     });
 
     let tx = Tx {
@@ -188,14 +185,12 @@ pub struct Rx<T, const N: usize> {
     inner: Arc<Inner<T, N>>,
 }
 
+/// This struct is `Unpin`
 struct TxRef<'a, T, const N: usize> {
     inner: &'a Tx<T, N>,
     val: Option<T>,
-    // TODO: why is this needed?
-    _p: PhantomPinned,
 }
 
-// TODO: why does T: Unpin need?
 impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
     type Output = Result<(), TxError>;
     fn poll(
@@ -214,6 +209,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
             let waker = cx.waker().clone();
             let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
             guard.push_back(waker);
+            drop(guard);
 
             return Poll::Pending;
         }
@@ -240,7 +236,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     let index = self.inner.inner.get_buf_index(next);
                     // SAFETY: TODO
                     let this = unsafe { self.get_unchecked_mut() };
-                    let v = this.val.take().expect("aaaaaaaaa");
+                    let v = this.val.take().expect("inner value should not be None");
                     this.inner.inner.write_at(index, v);
 
                     return Poll::Ready(Ok(()));
@@ -260,8 +256,9 @@ impl<T, const N: usize> Tx<T, N> {
         let fut = TxRef {
             inner: self,
             val: Some(v),
-            _p: PhantomPinned,
         };
+
+        // `TxRef` is pinned here
         fut.await
     }
 
@@ -314,21 +311,23 @@ impl<T, const N: usize> Rx<T, N> {
     pub async fn recv(&self) -> Option<T> {
         todo!()
     }
+
+    /// Try to receive a value from the queue.
+    ///
+    /// If there is no value available, then returns `Err(RxError::NoValue)`,
+    /// otherwise returns a value.
+    ///
+    /// Note that this api returns `RxError::NoValue` even if all senders are
+    /// dropped and there is no value available.
     pub fn try_recv(&self) -> Result<T, RxError> {
         let mut cur_tail = self.inner.tail.load(SeqCst);
 
         loop {
             let cur_tail_pos = self.inner.get_buf_index(cur_tail);
             let cur_head = self.inner.head.load(SeqCst);
-            let cur_head_pos = self.inner.get_buf_index(cur_head);
 
-            // Check if buffer is closed.
-            if self.inner.is_closed(cur_head) {
-                return Err(RxError::Closed);
-            }
-
-            // Is there a value to read?
-            if cur_tail_pos == cur_head_pos {
+            // Is there a value to read? Ignore the closed bit
+            if cur_head & !self.inner.get_closed_bit() == cur_tail & !self.inner.get_closed_bit() {
                 return Err(RxError::NoValueToRead);
             }
 
@@ -348,7 +347,17 @@ impl<T, const N: usize> Rx<T, N> {
             {
                 Ok(_) => {
                     // read at cur_tail value! (not next)
-                    return Ok(self.inner.read_at(cur_tail_pos));
+                    let res = self.inner.read_at(cur_tail_pos);
+
+                    // If there is a waiting `Tx` task, then wake it up
+                    let mut guard = self.inner.tx_wakers.lock().unwrap();
+                    if guard.front().is_some() {
+                        let waker = guard.pop_front().unwrap();
+                        waker.wake();
+                    }
+                    drop(guard);
+
+                    return Ok(res);
                 }
                 Err(now) => cur_tail = now,
             }
@@ -473,7 +482,7 @@ mod loom_test {
         loom::model(|| {
             let (tx, rx) = bounded::<i32, 10>();
             drop(tx);
-            assert_eq!(rx.try_recv(), Err(RxError::Closed))
+            assert_eq!(rx.try_recv(), Err(RxError::NoValueToRead))
         });
     }
 
@@ -514,6 +523,29 @@ mod loom_test {
 
             tx.try_send(43).unwrap();
             assert_eq!(rx.try_recv(), Ok(43));
+        });
+    }
+
+    #[test]
+    fn max_cap() {
+        loom::model(|| {
+            let (tx, _rx) = bounded::<i32, 1>();
+            assert_eq!(tx.try_send(0), Ok(()));
+            assert_eq!(tx.try_send(0), Err(TxError::Full));
+        });
+    }
+
+    #[test]
+    fn send_wake_up() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 1>();
+            let jh = thread::spawn(move || {
+                loom::future::block_on(async {
+                    tx.try_send(1).unwrap();
+                });
+            });
+            jh.join().unwrap();
+            assert_eq!(rx.try_recv(), Ok(1));
         });
     }
 

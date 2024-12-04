@@ -71,12 +71,21 @@ impl<T, const N: usize> Inner<T, N> {
 
     #[inline(always)]
     fn one_lap(&self) -> usize {
-        N.next_power_of_two() << 1
+        self.carry_up_next_power_of_two() << 1
     }
 
     #[inline(always)]
     fn get_closed_bit(&self) -> usize {
-        N.next_power_of_two()
+        self.carry_up_next_power_of_two()
+    }
+
+    #[inline(always)]
+    fn carry_up_next_power_of_two(&self) -> usize {
+        if N == N.next_power_of_two() {
+            (N + 1).next_power_of_two()
+        } else {
+            N.next_power_of_two()
+        }
     }
 
     #[inline(always)]
@@ -197,7 +206,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let cur_head = self.inner.inner.head.load(SeqCst);
+        let mut cur_head = self.inner.inner.head.load(SeqCst);
         let cur_tail = self.inner.inner.tail.load(SeqCst);
 
         if self.inner.inner.is_closed(cur_tail) {
@@ -214,15 +223,15 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
             return Poll::Pending;
         }
 
-        // If there still be a space, then try to send a value
-        let mut cur_head = self.inner.inner.head.load(Relaxed);
-
         loop {
-            let next = if cur_head + 1 == N {
+            // If there still be a space, then try to send a value
+            let cur_head_pos = self.inner.inner.get_buf_index(cur_head);
+
+            let next = if cur_head_pos + 1 == N {
                 // next lap
                 (cur_head + self.inner.inner.one_lap()) & !(self.inner.inner.one_lap() - 1)
             } else {
-                cur_head + 1
+                cur_head_pos + 1
             };
 
             // try to update head
@@ -233,11 +242,10 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                 .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
             {
                 Ok(_) => {
-                    let index = self.inner.inner.get_buf_index(next);
                     // SAFETY: TODO
                     let this = unsafe { self.get_unchecked_mut() };
                     let v = this.val.take().expect("inner value should not be None");
-                    this.inner.inner.write_at(index, v);
+                    this.inner.inner.write_at(cur_head_pos, v);
 
                     return Poll::Ready(Ok(()));
                 }
@@ -445,6 +453,7 @@ mod loom_test {
 
     use super::*;
     use loom::thread;
+    use tokio_test::{assert_pending, assert_ready, assert_ready_ok, task};
 
     #[test]
     fn try_send_and_try_recv() {
@@ -539,13 +548,16 @@ mod loom_test {
     fn send_wake_up() {
         loom::model(|| {
             let (tx, rx) = bounded::<i32, 1>();
-            let jh = thread::spawn(move || {
-                loom::future::block_on(async {
-                    tx.try_send(1).unwrap();
-                });
-            });
-            jh.join().unwrap();
+
+            let mut task = task::spawn(tx.send(1));
+            assert_ready_ok!(task.poll());
+
+            let mut task = task::spawn(tx.send(2));
+            assert_pending!(task.poll());
+
             assert_eq!(rx.try_recv(), Ok(1));
+            assert_ready_ok!(task.poll());
+            assert_eq!(rx.try_recv(), Ok(2));
         });
     }
 

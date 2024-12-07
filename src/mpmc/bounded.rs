@@ -4,7 +4,7 @@ use crate::loom_wrapper::{Arc, AtomicUsize, Mutex, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::mem::MaybeUninit;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Poll, Waker};
 
 ///  rx                   tx
@@ -101,6 +101,43 @@ impl<T, const N: usize> Inner<T, N> {
     fn pack_pos(&self, pos: usize, packed: usize) -> usize {
         pos | (!(N.next_power_of_two() - 1) & packed)
     }
+
+    /// If this sender can acquire a position to write
+    /// then this function returns Ok(pos), otherwise Err(_).
+    fn start_send(&self) -> Result<usize, TxError> {
+        let mut cur_head = self.head.load(SeqCst);
+
+        loop {
+            let cur_tail = self.tail.load(SeqCst);
+
+            if self.is_closed(cur_tail) {
+                return Err(TxError::Closed);
+            }
+
+            if self.is_full(cur_head, cur_tail) {
+                return Err(TxError::Full);
+            }
+
+            // If there still be a space, then try to send a value
+            let cur_head_pos = self.get_buf_index(cur_head);
+
+            let next = if cur_head_pos + 1 == N {
+                // next lap
+                (cur_head + self.one_lap()) & !(self.one_lap() - 1)
+            } else {
+                cur_head_pos + 1
+            };
+
+            // try to update head
+            match self
+                .head
+                .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
+            {
+                Ok(_) => return Ok(cur_head_pos),
+                Err(now) => cur_head = now,
+            }
+        }
+    }
 }
 
 impl<T, const N: usize> Drop for Inner<T, N> {
@@ -194,48 +231,26 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut cur_head = self.inner.inner.head.load(SeqCst);
-        let cur_tail = self.inner.inner.tail.load(SeqCst);
+        {
+            let res = self.inner.inner.start_send();
+            match res {
+                Err(TxError::Full) => {
+                    let waker = cx.waker().clone();
+                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
+                    guard.push_back(waker);
+                    drop(guard);
+                    return Poll::Pending;
+                }
+                Err(TxError::Closed) => return Poll::Ready(Err(TxError::Closed)),
+                Ok(pos) => {
+                    debug_assert!(pos < N);
 
-        if self.inner.inner.is_closed(cur_tail) {
-            return Poll::Ready(Err(TxError::Closed));
-        }
-
-        if self.inner.inner.is_full(cur_head, cur_tail) {
-            // Push this TxRef into the wait list
-            let waker = cx.waker().clone();
-            let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-            guard.push_back(waker);
-            drop(guard);
-
-            return Poll::Pending;
-        }
-
-        loop {
-            // If there still be a space, then try to send a value
-            let cur_head_pos = self.inner.inner.get_buf_index(cur_head);
-
-            let next = if cur_head_pos + 1 == N {
-                // next lap
-                (cur_head + self.inner.inner.one_lap()) & !(self.inner.inner.one_lap() - 1)
-            } else {
-                cur_head_pos + 1
-            };
-
-            // try to update head
-            match self
-                .inner
-                .inner
-                .head
-                .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
-            {
-                Ok(_) => {
                     // SAFETY: TODO
                     let this = unsafe { self.get_unchecked_mut() };
                     let v = this.val.take().expect("inner value should not be None");
-                    this.inner.inner.write_at(cur_head_pos, v);
+                    this.inner.inner.write_at(pos, v);
 
-                    // If there is a waiting `Rx` task, then wake it up
+                    // // If there is a waiting `Rx` task, then wake it up
                     let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
                     if guard.front().is_some() {
                         let waker = guard.pop_front().unwrap();
@@ -244,9 +259,6 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     drop(guard);
 
                     return Poll::Ready(Ok(()));
-                }
-                Err(now) => {
-                    cur_head = now;
                 }
             }
         }
@@ -330,53 +342,22 @@ impl<T, const N: usize> Tx<T, N> {
     }
 
     pub fn try_send(&self, v: T) -> Result<(), TxError> {
-        let mut cur_head = self.inner.head.load(Relaxed);
+        match self.inner.start_send() {
+            Err(e) => Err(e),
+            Ok(pos) => {
+                debug_assert!(pos < N);
 
-        loop {
-            let cur_tail = self.inner.tail.load(Relaxed);
+                self.inner.write_at(pos, v);
 
-            // Check if buffer is closed.
-            if self.inner.is_closed(cur_tail) {
-                return Err(TxError::Closed);
-            }
-
-            // Check if buffer if full.
-            if self.inner.is_full(cur_head, cur_tail) {
-                return Err(TxError::Full);
-            }
-
-            let next = if self.inner.get_buf_index(cur_head) + 1 == N {
-                // next lap
-                (cur_head + self.inner.one_lap()) & !(self.inner.one_lap() - 1)
-            } else {
-                cur_head + 1
-            };
-
-            // try to update head
-            match self
-                .inner
-                .head
-                .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
-            {
-                Ok(_) => {
-                    // Write at *previous* pos.
-                    let index = self.inner.get_buf_index(cur_head);
-
-                    self.inner.write_at(index, v);
-
-                    // If there is a waiting `Rx` task, then wake it up
-                    let mut guard = self.inner.rx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
-                        waker.wake();
-                    }
-                    drop(guard);
-
-                    return Ok(());
+                // // If there is a waiting `Rx` task, then wake it up
+                let mut guard = self.inner.rx_wakers.lock().unwrap();
+                if guard.front().is_some() {
+                    let waker = guard.pop_front().unwrap();
+                    waker.wake();
                 }
-                Err(now) => {
-                    cur_head = now;
-                }
+                drop(guard);
+
+                return Ok(());
             }
         }
     }

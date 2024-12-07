@@ -1,5 +1,9 @@
 //! Array based bounded async mpmc channel.
 
+/// Optimization ideas:
+/// · batch insert / delete
+/// · use lock-free linked list for the waiter
+/// · fast-path, slow-path
 use crate::loom_wrapper::{Arc, AtomicUsize, Mutex, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;

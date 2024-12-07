@@ -138,6 +138,39 @@ impl<T, const N: usize> Inner<T, N> {
             }
         }
     }
+
+    /// If this receiver can acquire a position to read
+    /// then this function returns Ok(pos), otherwise Err(_).
+    fn start_recv(&self) -> Result<usize, RxError> {
+        let mut cur_tail = self.tail.load(SeqCst);
+
+        loop {
+            let cur_tail_pos = self.get_buf_index(cur_tail);
+            let cur_head = self.head.load(SeqCst);
+
+            // Is there a value to read? Ignore the closed bit
+            if cur_head & !self.get_closed_bit() == cur_tail & !self.get_closed_bit() {
+                return Err(RxError::NoValueToRead);
+            }
+
+            let next_pos = if cur_tail_pos + 1 == N {
+                // next lap
+                (cur_tail_pos + self.one_lap()) & !(self.one_lap() - 1)
+            } else {
+                cur_tail_pos + 1
+            };
+
+            let next = self.pack_pos(next_pos, cur_tail);
+
+            match self
+                .tail
+                .compare_exchange_weak(cur_tail, next, SeqCst, SeqCst)
+            {
+                Ok(_) => return Ok(cur_tail_pos),
+                Err(now) => cur_tail = now,
+            }
+        }
+    }
 }
 
 impl<T, const N: usize> Drop for Inner<T, N> {
@@ -273,56 +306,29 @@ struct RxRef<'a, T, const N: usize> {
 impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
     type Output = Result<T, RxError>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut cur_tail = self.inner.inner.tail.load(SeqCst);
-
-        loop {
-            let cur_tail_pos = self.inner.inner.get_buf_index(cur_tail);
-            let cur_head = self.inner.inner.head.load(SeqCst);
-
-            // Is there a value to read? Ignore the closed bit
-            if cur_head & !self.inner.inner.get_closed_bit()
-                == cur_tail & !self.inner.inner.get_closed_bit()
-            {
+        match self.inner.inner.start_recv() {
+            Err(RxError::NoValueToRead) => {
                 let waker = cx.waker().clone();
                 let mut guard = self.inner.inner.rx_wakers.lock().unwrap();
                 guard.push_back(waker);
                 drop(guard);
 
-                return Poll::Pending;
+                Poll::Pending
             }
+            Err(RxError::Closed) => Poll::Ready(Err(RxError::Closed)),
+            Ok(pos) => {
+                // read at cur_tail value! (not next)
+                let res = self.inner.inner.read_at(pos);
 
-            // There is a space to read!
-
-            let next_pos = if cur_tail_pos + 1 == N {
-                // next lap
-                (cur_tail_pos + self.inner.inner.one_lap()) & !(self.inner.inner.one_lap() - 1)
-            } else {
-                cur_tail_pos + 1
-            };
-
-            let next = self.inner.inner.pack_pos(next_pos, cur_tail);
-
-            match self
-                .inner
-                .inner
-                .tail
-                .compare_exchange_weak(cur_tail, next, SeqCst, SeqCst)
-            {
-                Ok(_) => {
-                    // read at cur_tail value! (not next)
-                    let res = self.inner.inner.read_at(cur_tail_pos);
-
-                    // If there is a waiting `Tx` task, then wake it up
-                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
-                        waker.wake();
-                    }
-                    drop(guard);
-
-                    return Poll::Ready(Ok(res));
+                // If there is a waiting `Tx` task, then wake it up
+                let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
+                if guard.front().is_some() {
+                    let waker = guard.pop_front().unwrap();
+                    waker.wake();
                 }
-                Err(now) => cur_tail = now,
+                drop(guard);
+
+                Poll::Ready(Ok(res))
             }
         }
     }
@@ -377,46 +383,21 @@ impl<T, const N: usize> Rx<T, N> {
     /// Note that this api returns `RxError::NoValue` even if all senders are
     /// dropped and there is no value available.
     pub fn try_recv(&self) -> Result<T, RxError> {
-        let mut cur_tail = self.inner.tail.load(SeqCst);
+        match self.inner.start_recv() {
+            Err(e) => Err(e),
+            Ok(pos) => {
+                // read at cur_tail value! (not next)
+                let res = self.inner.read_at(pos);
 
-        loop {
-            let cur_tail_pos = self.inner.get_buf_index(cur_tail);
-            let cur_head = self.inner.head.load(SeqCst);
-
-            // Is there a value to read? Ignore the closed bit
-            if cur_head & !self.inner.get_closed_bit() == cur_tail & !self.inner.get_closed_bit() {
-                return Err(RxError::NoValueToRead);
-            }
-
-            let next_pos = if cur_tail_pos + 1 == N {
-                // next lap
-                (cur_tail_pos + self.inner.one_lap()) & !(self.inner.one_lap() - 1)
-            } else {
-                cur_tail_pos + 1
-            };
-
-            let next = self.inner.pack_pos(next_pos, cur_tail);
-
-            match self
-                .inner
-                .tail
-                .compare_exchange_weak(cur_tail, next, SeqCst, SeqCst)
-            {
-                Ok(_) => {
-                    // read at cur_tail value! (not next)
-                    let res = self.inner.read_at(cur_tail_pos);
-
-                    // If there is a waiting `Tx` task, then wake it up
-                    let mut guard = self.inner.tx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
-                        waker.wake();
-                    }
-                    drop(guard);
-
-                    return Ok(res);
+                // If there is a waiting `Tx` task, then wake it up
+                let mut guard = self.inner.tx_wakers.lock().unwrap();
+                if guard.front().is_some() {
+                    let waker = guard.pop_front().unwrap();
+                    waker.wake();
                 }
-                Err(now) => cur_tail = now,
+                drop(guard);
+
+                Ok(res)
             }
         }
     }

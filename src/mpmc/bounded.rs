@@ -7,6 +7,7 @@
 use crate::loom_wrapper::{Arc, AtomicUsize, Mutex, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;
+use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Poll, Waker};
@@ -260,6 +261,7 @@ pub struct Rx<T, const N: usize> {
 struct TxRef<'a, T, const N: usize> {
     inner: &'a Tx<T, N>,
     val: Option<T>,
+    _p: PhantomPinned,
 }
 
 impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
@@ -282,7 +284,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                 Ok(pos) => {
                     debug_assert!(pos < N);
 
-                    // SAFETY: TODO
+                    // SAFETY: `TxRef` is `!Unpin`, so it is guarantee that `Self` won't move.
                     let this = unsafe { self.get_unchecked_mut() };
                     let v = this.val.take().expect("inner value should not be None");
                     this.inner.inner.write_at(pos, v);
@@ -345,6 +347,7 @@ impl<T, const N: usize> Tx<T, N> {
         let fut = TxRef {
             inner: self,
             val: Some(v),
+            _p: PhantomPinned,
         };
 
         // `TxRef` is pinned here

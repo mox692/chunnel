@@ -17,7 +17,7 @@ use std::task::{Poll, Waker};
 ///  [ ]   -   [ ]   -   [ ]    -> ...
 ///  tail                head
 struct Inner<T, const N: usize> {
-    bucket: [UnsafeCell<MaybeUninit<T>>; N],
+    bucket: [Bucket<T>; N],
 
     /// A place next sender will write to.
     /// closed == 1 if all tx are dropped
@@ -42,19 +42,30 @@ struct Inner<T, const N: usize> {
     rx_wakers: Mutex<VecDeque<Waker>>,
 }
 
+struct Bucket<T> {
+    data: UnsafeCell<MaybeUninit<T>>,
+    stamp: AtomicUsize,
+}
+
 impl<T, const N: usize> Inner<T, N> {
     fn write_at(&self, index: usize, v: T) {
         debug_assert!(index < N);
 
         // SAFETY: Index must not be out of range (not greater than N).
-        unsafe { (self.bucket.as_ptr() as *mut T).add(index).write(v) };
+        self.bucket[index]
+            .data
+            // TODO: loom says that there is a concurrent read during this with_mut operation.
+            // i.e. read may not see this latest value
+            .with_mut(|ptr| unsafe { (ptr as *mut T).write(v) });
     }
 
     fn read_at(&self, index: usize) -> T {
         debug_assert!(index < N);
 
         // SAFETY: Index must not be out of range (not greater than N).
-        unsafe { (self.bucket.as_ptr() as *mut T).add(index).read() }
+        self.bucket[index]
+            .data
+            .with(|ptr| unsafe { ptr.read().assume_init() })
     }
 
     // If passed a Rx packed value, then check if all rxes are closed (i.e. dropped )or not.
@@ -107,20 +118,26 @@ impl<T, const N: usize> Inner<T, N> {
         pos | (!(N.next_power_of_two() - 1) & packed)
     }
 
+    fn get_stamp(&self, index: usize) -> usize {
+        debug_assert!(index < N);
+        self.bucket[index].stamp.load(SeqCst)
+    }
+
     /// If this sender can acquire a position to write
     /// then this function returns Ok(pos), otherwise Err(_).
     fn start_send(&self) -> Result<usize, TxError> {
         let mut cur_head = self.head.load(SeqCst);
 
         loop {
-            let cur_tail = self.tail.load(SeqCst);
-
-            if self.is_closed(cur_tail) {
+            if self.is_closed(cur_head) {
                 return Err(TxError::Closed);
             }
-
-            if self.is_full(cur_head, cur_tail) {
+            // If there still be a space, then try to send a value
+            let stamp = self.get_stamp(self.get_buf_index(cur_head));
+            if stamp < cur_head {
                 return Err(TxError::Full);
+            } else if cur_head < stamp {
+                continue;
             }
 
             // If there still be a space, then try to send a value
@@ -138,7 +155,10 @@ impl<T, const N: usize> Inner<T, N> {
                 .head
                 .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
             {
-                Ok(_) => return Ok(cur_head_pos),
+                Ok(_) => {
+                    self.bucket[cur_head_pos].stamp.fetch_add(1, SeqCst);
+                    return Ok(cur_head_pos);
+                }
                 Err(now) => cur_head = now,
             }
         }
@@ -151,11 +171,12 @@ impl<T, const N: usize> Inner<T, N> {
 
         loop {
             let cur_tail_pos = self.get_buf_index(cur_tail);
-            let cur_head = self.head.load(SeqCst);
 
-            // Is there a value to read? Ignore the closed bit
-            if cur_head & !self.get_closed_bit() == cur_tail & !self.get_closed_bit() {
+            let stamp = self.get_stamp(self.get_buf_index(cur_tail));
+            if stamp < cur_tail + 1 {
                 return Err(RxError::NoValueToRead);
+            } else if cur_tail + 1 < stamp {
+                continue;
             }
 
             let next_pos = if cur_tail_pos + 1 == N {
@@ -171,7 +192,12 @@ impl<T, const N: usize> Inner<T, N> {
                 .tail
                 .compare_exchange_weak(cur_tail, next, SeqCst, SeqCst)
             {
-                Ok(_) => return Ok(cur_tail_pos),
+                Ok(_) => {
+                    let next = cur_tail_pos + self.one_lap();
+                    self.bucket[cur_tail_pos].stamp.store(next, SeqCst);
+
+                    return Ok(cur_tail_pos);
+                }
                 Err(now) => cur_tail = now,
             }
         }
@@ -189,7 +215,9 @@ impl<T, const N: usize> Drop for Inner<T, N> {
 
         for i in cur_tail_pos..cur_head_pos {
             // SAFETY: Index must not be out of range (not greater than N).
-            let v = unsafe { (self.bucket.as_ptr() as *mut T).add(i).read() };
+            let v = self.bucket[i]
+                .data
+                .with(|ptr| unsafe { ptr.read().assume_init() });
             drop(v);
         }
     }
@@ -200,7 +228,10 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
     assert!(1 <= N, "Capacity must be greater than 1");
 
     let inner = Arc::new(Inner {
-        bucket: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+        bucket: std::array::from_fn(|i| Bucket {
+            data: UnsafeCell::new(MaybeUninit::uninit()),
+            stamp: AtomicUsize::new(i),
+        }),
         head: AtomicUsize::new(0),
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),
@@ -287,6 +318,8 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     // SAFETY: `TxRef` is `!Unpin`, so it is guarantee that `Self` won't move.
                     let this = unsafe { self.get_unchecked_mut() };
                     let v = this.val.take().expect("inner value should not be None");
+                    // TODO: loom says that there is a concurrent read_at during this operation.
+                    // i.e. read may not see this latest value.
                     this.inner.inner.write_at(pos, v);
 
                     // // If there is a waiting `Rx` task, then wake it up
@@ -312,29 +345,42 @@ struct RxRef<'a, T, const N: usize> {
 impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
     type Output = Result<T, RxError>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        match self.inner.inner.start_recv() {
-            Err(RxError::NoValueToRead) => {
-                let waker = cx.waker().clone();
-                let mut guard = self.inner.inner.rx_wakers.lock().unwrap();
-                guard.push_back(waker);
-                drop(guard);
+        loop {
+            match self.inner.inner.start_recv() {
+                Err(RxError::NoValueToRead) => {
+                    let waker = cx.waker().clone();
 
-                Poll::Pending
-            }
-            Err(RxError::Closed) => Poll::Ready(Err(RxError::Closed)),
-            Ok(pos) => {
-                // read at cur_tail value! (not next)
-                let res = self.inner.inner.read_at(pos);
+                    let mut guard = self.inner.inner.rx_wakers.lock().unwrap();
 
-                // If there is a waiting `Tx` task, then wake it up
-                let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-                if guard.front().is_some() {
-                    let waker = guard.pop_front().unwrap();
-                    waker.wake();
+                    // check if just inserted?
+                    let cur_head = self.inner.inner.head.load(SeqCst);
+                    let cur_tail = self.inner.inner.tail.load(SeqCst);
+                    if cur_tail < cur_head {
+                        // TODO: solve loom issue: "Causality violation: Concurrent read and write accesses."
+                        drop(guard);
+                        continue;
+                    }
+
+                    guard.push_back(waker);
+                    drop(guard);
+
+                    return Poll::Pending;
                 }
-                drop(guard);
+                Err(RxError::Closed) => return Poll::Ready(Err(RxError::Closed)),
+                Ok(pos) => {
+                    // read at cur_tail value! (not next)
+                    let res = self.inner.inner.read_at(pos);
 
-                Poll::Ready(Ok(res))
+                    // If there is a waiting `Tx` task, then wake it up
+                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
+                    if guard.front().is_some() {
+                        let waker = guard.pop_front().unwrap();
+                        waker.wake();
+                    }
+                    drop(guard);
+
+                    return Poll::Ready(Ok(res));
+                }
             }
         }
     }
@@ -480,6 +526,18 @@ impl<T, const N: usize> Drop for Rx<T, N> {
                 cur_tail = now;
                 next = self.inner.get_closed_bit() | cur_tail;
             }
+
+            // TODO: refactor
+            let mut cur_head = self.inner.head.load(SeqCst);
+            let mut next = self.inner.get_closed_bit() | cur_head;
+            while let Err(now) = self
+                .inner
+                .head
+                .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
+            {
+                cur_head = now;
+                next = self.inner.get_closed_bit() | cur_head;
+            }
         }
     }
 }
@@ -610,6 +668,28 @@ mod loom_test {
             assert_ready_ok!(tx_task.poll());
 
             assert_ready_ok!(rx_task.poll());
+        });
+    }
+
+    #[test]
+    fn send_wake_up_2() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 1>();
+
+            let jh = loom::thread::spawn(move || {
+                loom::future::block_on(async {
+                    let v = rx.recv().await.unwrap();
+
+                    assert_eq!(v, 1);
+                });
+            });
+
+            loom::future::block_on(async {
+                tx.send(1).await.unwrap();
+                // tx.send(2).await.unwrap();
+            });
+
+            jh.join().unwrap()
         });
     }
 

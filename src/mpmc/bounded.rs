@@ -156,7 +156,6 @@ impl<T, const N: usize> Inner<T, N> {
                 .compare_exchange_weak(cur_head, next, SeqCst, SeqCst)
             {
                 Ok(_) => {
-                    self.bucket[cur_head_pos].stamp.fetch_add(1, SeqCst);
                     return Ok(cur_head_pos);
                 }
                 Err(now) => cur_head = now,
@@ -318,11 +317,12 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     // SAFETY: `TxRef` is `!Unpin`, so it is guarantee that `Self` won't move.
                     let this = unsafe { self.get_unchecked_mut() };
                     let v = this.val.take().expect("inner value should not be None");
-                    // TODO: loom says that there is a concurrent read_at during this operation.
-                    // i.e. read may not see this latest value.
                     this.inner.inner.write_at(pos, v);
 
-                    // // If there is a waiting `Rx` task, then wake it up
+                    // It is gagaranteed that a Rx that see this updated stamp must also see the latest
+                    // written value `v`.
+                    this.inner.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
+
                     let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
                     if guard.front().is_some() {
                         let waker = guard.pop_front().unwrap();
@@ -356,8 +356,14 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     let cur_head = self.inner.inner.head.load(SeqCst);
                     let cur_tail = self.inner.inner.tail.load(SeqCst);
                     if cur_tail < cur_head {
-                        // TODO: solve loom issue: "Causality violation: Concurrent read and write accesses."
                         drop(guard);
+
+                        // This is required for loom tests, since in theory there are some scenarios where
+                        // Tx's CAS succeeded but stamp has not yet updated. In those cases, a thread trying
+                        // to read value by a Rx could run into infinite loop.
+                        #[cfg(all(loom, test))]
+                        loom::thread::yield_now();
+
                         continue;
                     }
 
@@ -407,6 +413,9 @@ impl<T, const N: usize> Tx<T, N> {
                 debug_assert!(pos < N);
 
                 self.inner.write_at(pos, v);
+                // It is gagaranteed that a Rx that see this updated stamp must also see the latest
+                // written value `v`.
+                self.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
                 // // If there is a waiting `Rx` task, then wake it up
                 let mut guard = self.inner.rx_wakers.lock().unwrap();
@@ -672,9 +681,9 @@ mod loom_test {
     }
 
     #[test]
-    fn send_wake_up_2() {
+    fn send_wake_up_multi_thread() {
         loom::model(|| {
-            let (tx, rx) = bounded::<i32, 1>();
+            let (tx, rx) = bounded::<i32, 2>();
 
             let jh = loom::thread::spawn(move || {
                 loom::future::block_on(async {
@@ -686,7 +695,6 @@ mod loom_test {
 
             loom::future::block_on(async {
                 tx.send(1).await.unwrap();
-                // tx.send(2).await.unwrap();
             });
 
             jh.join().unwrap()

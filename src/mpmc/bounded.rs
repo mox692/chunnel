@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Poll, Waker};
 
@@ -36,10 +37,35 @@ struct Inner<T, const N: usize> {
     rx_count: AtomicUsize,
 
     /// Wait list of `Tx`
-    tx_wakers: Mutex<VecDeque<Waker>>,
+    tx_wakers: WakerQueue,
 
     /// Wait list of `Rx`
-    rx_wakers: Mutex<VecDeque<Waker>>,
+    rx_wakers: WakerQueue,
+}
+
+struct WakerQueue {
+    wakers: Mutex<VecDeque<Waker>>,
+    is_empty: AtomicBool,
+}
+
+impl WakerQueue {
+    const fn new() -> Self {
+        Self {
+            wakers: Mutex::new(VecDeque::new()),
+            is_empty: AtomicBool::new(true),
+        }
+    }
+    fn push_back(&self, waker: Waker) {
+        let mut guard = self.wakers.lock().unwrap();
+        guard.push_back(waker);
+    }
+    fn pop_front(&self) -> Option<Waker> {
+        let mut guard = self.wakers.lock().unwrap();
+        guard.pop_front()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty.load(SeqCst)
+    }
 }
 
 struct Bucket<T> {
@@ -236,8 +262,8 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),
         rx_count: AtomicUsize::new(1),
-        tx_wakers: Mutex::new(VecDeque::new()),
-        rx_wakers: Mutex::new(VecDeque::new()),
+        tx_wakers: WakerQueue::new(),
+        rx_wakers: WakerQueue::new(),
     });
 
     let tx = Tx {
@@ -306,9 +332,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
             match res {
                 Err(TxError::Full) => {
                     let waker = cx.waker().clone();
-                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-                    guard.push_back(waker);
-                    drop(guard);
+                    self.inner.inner.tx_wakers.push_back(waker);
                     return Poll::Pending;
                 }
                 Err(TxError::Closed) => return Poll::Ready(Err(TxError::Closed)),
@@ -324,12 +348,10 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     // written value `v`.
                     this.inner.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
-                    let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
+                    if !this.inner.inner.rx_wakers.is_empty() {
+                        let waker = this.inner.inner.rx_wakers.pop_front().unwrap();
                         waker.wake();
                     }
-                    drop(guard);
 
                     return Poll::Ready(Ok(()));
                 }
@@ -351,14 +373,10 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                 Err(RxError::NoValueToRead) => {
                     let waker = cx.waker().clone();
 
-                    let mut guard = self.inner.inner.rx_wakers.lock().unwrap();
-
                     // check if just inserted?
                     let cur_head = self.inner.inner.head.load(SeqCst);
                     let cur_tail = self.inner.inner.tail.load(SeqCst);
                     if cur_tail < cur_head {
-                        drop(guard);
-
                         // This is required for loom tests, since in theory there are some scenarios where
                         // Tx's CAS succeeded but stamp has not yet updated. In those cases, a thread trying
                         // to read value by a Rx could run into infinite loop.
@@ -368,8 +386,7 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                         continue;
                     }
 
-                    guard.push_back(waker);
-                    drop(guard);
+                    self.inner.inner.rx_wakers.push_back(waker);
 
                     return Poll::Pending;
                 }
@@ -381,12 +398,10 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     self.inner.inner.bucket[pos].stamp.store(next, SeqCst);
 
                     // If there is a waiting `Tx` task, then wake it up
-                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
+                    if !self.inner.inner.tx_wakers.is_empty() {
+                        let waker = self.inner.inner.rx_wakers.pop_front().unwrap();
                         waker.wake();
                     }
-                    drop(guard);
 
                     return Poll::Ready(Ok(res));
                 }
@@ -421,12 +436,10 @@ impl<T, const N: usize> Tx<T, N> {
                 self.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
                 // // If there is a waiting `Rx` task, then wake it up
-                let mut guard = self.inner.rx_wakers.lock().unwrap();
-                if guard.front().is_some() {
-                    let waker = guard.pop_front().unwrap();
+                if !self.inner.rx_wakers.is_empty() {
+                    let waker = self.inner.rx_wakers.pop_front().unwrap();
                     waker.wake();
                 }
-                drop(guard);
 
                 return Ok(());
             }
@@ -457,12 +470,10 @@ impl<T, const N: usize> Rx<T, N> {
                 self.inner.bucket[pos].stamp.store(next, SeqCst);
 
                 // If there is a waiting `Tx` task, then wake it up
-                let mut guard = self.inner.tx_wakers.lock().unwrap();
-                if guard.front().is_some() {
-                    let waker = guard.pop_front().unwrap();
+                if !self.inner.tx_wakers.is_empty() {
+                    let waker = self.inner.rx_wakers.pop_front().unwrap();
                     waker.wake();
                 }
-                drop(guard);
 
                 Ok(res)
             }

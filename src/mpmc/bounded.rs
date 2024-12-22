@@ -17,7 +17,7 @@ use std::task::{Poll, Waker};
 ///  [ ]   -   [ ]   -   [ ]    -> ...
 ///  tail                head
 struct Inner<T, const N: usize> {
-    bucket: [Bucket<T>; N],
+    bucket: Box<[Bucket<T>]>,
 
     /// A place next sender will write to.
     /// closed == 1 if all tx are dropped
@@ -226,10 +226,12 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
     assert!(1 <= N, "Capacity must be greater than 1");
 
     let inner = Arc::new(Inner {
-        bucket: std::array::from_fn(|i| Bucket {
-            data: UnsafeCell::new(MaybeUninit::uninit()),
-            stamp: AtomicUsize::new(i),
-        }),
+        bucket: (0..N)
+            .map(|i| Bucket {
+                data: UnsafeCell::new(MaybeUninit::uninit()),
+                stamp: AtomicUsize::new(i),
+            })
+            .collect(),
         head: AtomicUsize::new(0),
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),

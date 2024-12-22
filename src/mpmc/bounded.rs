@@ -137,6 +137,7 @@ impl<T, const N: usize> Inner<T, N> {
             if stamp < cur_head {
                 return Err(TxError::Full);
             } else if cur_head < stamp {
+                cur_head = self.head.load(SeqCst);
                 continue;
             }
 
@@ -175,6 +176,7 @@ impl<T, const N: usize> Inner<T, N> {
             if stamp < cur_tail + 1 {
                 return Err(RxError::NoValueToRead);
             } else if cur_tail + 1 < stamp {
+                cur_tail = self.tail.load(SeqCst);
                 continue;
             }
 
@@ -192,9 +194,6 @@ impl<T, const N: usize> Inner<T, N> {
                 .compare_exchange_weak(cur_tail, next, SeqCst, SeqCst)
             {
                 Ok(_) => {
-                    let next = cur_tail_pos + self.one_lap();
-                    self.bucket[cur_tail_pos].stamp.store(next, SeqCst);
-
                     return Ok(cur_tail_pos);
                 }
                 Err(now) => cur_tail = now,
@@ -375,7 +374,9 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                 Err(RxError::Closed) => return Poll::Ready(Err(RxError::Closed)),
                 Ok(pos) => {
                     // read at cur_tail value! (not next)
+                    let next = pos + self.inner.inner.one_lap();
                     let res = self.inner.inner.read_at(pos);
+                    self.inner.inner.bucket[pos].stamp.store(next, SeqCst);
 
                     // If there is a waiting `Tx` task, then wake it up
                     let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
@@ -449,7 +450,9 @@ impl<T, const N: usize> Rx<T, N> {
             Err(e) => Err(e),
             Ok(pos) => {
                 // read at cur_tail value! (not next)
+                let next = pos + self.inner.one_lap();
                 let res = self.inner.read_at(pos);
+                self.inner.bucket[pos].stamp.store(next, SeqCst);
 
                 // If there is a waiting `Tx` task, then wake it up
                 let mut guard = self.inner.tx_wakers.lock().unwrap();
@@ -556,7 +559,7 @@ mod loom_test {
     use std::sync::mpsc::TryRecvError;
 
     use super::*;
-    use loom::thread;
+    use loom::thread::{self, yield_now};
     use tokio_test::{assert_pending, assert_ready, assert_ready_ok, task};
 
     #[test]
@@ -698,6 +701,51 @@ mod loom_test {
             });
 
             jh.join().unwrap()
+        });
+    }
+
+    // It takes 10 minutes or so
+    #[test]
+    fn multi_threads_send_recv() {
+        loom::model(|| {
+            let num_task = 1;
+            let msg_per_task = 1;
+            let num_threads = 2;
+
+            let (tx, rx) = bounded::<i32, 10>();
+
+            let mut jhs = vec![];
+            for _ in 0..num_threads {
+                let tx = tx.clone();
+                let jh = loom::thread::spawn(move || {
+                    for i in 0..num_task {
+                        loom::future::block_on(async {
+                            for j in 0..msg_per_task {
+                                tx.try_send(j + msg_per_task * i).unwrap();
+                            }
+                        });
+                    }
+                });
+                jhs.push(jh);
+            }
+
+            loom::future::block_on(async {
+                let mut num_msg = 0;
+                loop {
+                    if let Ok(_) = rx.try_recv() {
+                        num_msg += 1;
+                    }
+                    if num_task * msg_per_task <= num_msg {
+                        break;
+                    }
+
+                    yield_now();
+                }
+            });
+
+            for jh in jhs.drain(..) {
+                jh.join().unwrap();
+            }
         });
     }
 

@@ -11,6 +11,7 @@ rust-version = "1.80"
 [target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 async-channel = "2.3.1"
+crossbeam-channel = "0.5.14"
 criterion = "0.5.1"
 
 [target.'cfg(loom)'.dev-dependencies]

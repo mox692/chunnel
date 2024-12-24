@@ -1,5 +1,6 @@
 //! Array based bounded async mpmc channel.
 
+use super::backoff::Backoff;
 /// Optimization ideas:
 /// · batch insert / delete
 /// · use lock-free linked list for the waiter
@@ -153,8 +154,13 @@ impl<T, const N: usize> Inner<T, N> {
     /// then this function returns Ok(pos), otherwise Err(_).
     fn start_send(&self) -> Result<usize, TxError> {
         let mut cur_head = self.head.load(SeqCst);
+        // let backoff = Backoff::new();
 
+        let mut i = 0;
         loop {
+            if i > 60 && i > 0 {
+                println!("i: {i}");
+            }
             if self.is_closed(cur_head) {
                 return Err(TxError::Closed);
             }
@@ -163,6 +169,8 @@ impl<T, const N: usize> Inner<T, N> {
             if stamp < cur_head {
                 return Err(TxError::Full);
             } else if cur_head < stamp {
+                // backoff.snooze();
+                i += 1;
                 cur_head = self.head.load(SeqCst);
                 continue;
             }
@@ -185,7 +193,12 @@ impl<T, const N: usize> Inner<T, N> {
                 Ok(_) => {
                     return Ok(cur_head_pos);
                 }
-                Err(now) => cur_head = now,
+                Err(now) => {
+                    // backoff.spin();
+                    // backoff.snooze();
+                    i += 1;
+                    cur_head = now;
+                }
             }
         }
     }
@@ -194,7 +207,9 @@ impl<T, const N: usize> Inner<T, N> {
     /// then this function returns Ok(pos), otherwise Err(_).
     fn start_recv(&self) -> Result<usize, RxError> {
         let mut cur_tail = self.tail.load(SeqCst);
+        let backoff = Backoff::new();
 
+        let mut i = 0;
         loop {
             let cur_tail_pos = self.get_buf_index(cur_tail);
 
@@ -203,6 +218,7 @@ impl<T, const N: usize> Inner<T, N> {
                 return Err(RxError::NoValueToRead);
             } else if cur_tail + 1 < stamp {
                 cur_tail = self.tail.load(SeqCst);
+                i += 1;
                 continue;
             }
 
@@ -222,7 +238,11 @@ impl<T, const N: usize> Inner<T, N> {
                 Ok(_) => {
                     return Ok(cur_tail_pos);
                 }
-                Err(now) => cur_tail = now,
+                Err(now) => {
+                    // backoff.spin();
+                    i += 1;
+                    cur_tail = now;
+                }
             }
         }
     }

@@ -49,7 +49,7 @@ struct WakerQueue {
 }
 
 impl WakerQueue {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             wakers: Mutex::new(VecDeque::new()),
             is_empty: AtomicBool::new(true),

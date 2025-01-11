@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use async_concurrent_primitives::mpmc::bounded;
+use chunnel::mpmc::bounded;
 
 fn sync_api() {
     let num_threads = 100;

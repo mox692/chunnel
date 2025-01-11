@@ -49,11 +49,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: test tokio full
+      - name: test
         run: |
           set -euxo pipefail
           cargo test --package chunnel --lib
-        working-directory: tokio
 
   test-loom:
     name: test loom

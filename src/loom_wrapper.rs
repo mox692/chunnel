@@ -37,15 +37,6 @@ pub(crate) type AtomicUsize = std::sync::atomic::AtomicUsize;
 #[cfg(all(loom, test))]
 pub(crate) type AtomicUsize = loom::sync::atomic::AtomicUsize;
 
-#[cfg(not(all(loom, test)))]
-pub(crate) type AtomicBool = std::sync::atomic::AtomicBool;
-#[cfg(all(loom, test))]
-pub(crate) type AtomicBool = loom::sync::atomic::AtomicBool;
-
-#[cfg(not(all(loom, test)))]
-pub(crate) fn yield_now() {
-    std::thread::yield_now();
-}
 #[cfg(all(loom, test))]
 pub(crate) fn yield_now() {
     loom::thread::yield_now();

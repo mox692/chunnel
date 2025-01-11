@@ -75,16 +75,6 @@ impl<T, const N: usize> Inner<T, N> {
         closed_bit & packed == closed_bit
     }
 
-    // Return true if there are no spaces to write to due to the slow read by Rx.
-    #[inline(always)]
-    fn is_full(&self, packed_head: usize, packed_tail: usize) -> bool {
-        // ignore closed bit.
-        let head = packed_head & !self.get_closed_bit();
-        let tail = packed_tail & !self.get_closed_bit();
-
-        return (head - tail) == self.one_lap();
-    }
-
     #[inline(always)]
     fn one_lap(&self) -> usize {
         self.carry_up_next_power_of_two() << 1

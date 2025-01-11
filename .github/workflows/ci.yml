@@ -52,7 +52,7 @@ jobs:
       - name: test tokio full
         run: |
           set -euxo pipefail
-          cargo test --package async_concurrent_primitives --lib
+          cargo test --package chunnel --lib
         working-directory: tokio
 
   test-loom:
@@ -80,5 +80,5 @@ jobs:
       - name: test loom
         run: |
           set -euxo pipefail
-          cargo test --package async_concurrent_primitives --lib 
+          cargo test --package chunnel --lib 
         RUSTFLAGS: --cfg loom

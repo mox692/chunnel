@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use async_concurrent_primitives::mpmc::bounded;
+use chunnel::mpmc::bounded;
 
 use criterion::measurement::WallTime;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion};

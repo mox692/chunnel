@@ -353,7 +353,7 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                         // Tx's CAS succeeded but stamp has not yet updated. In those cases, a thread trying
                         // to read value by a Rx could run into infinite loop.
                         #[cfg(all(loom, test))]
-                        loom::thread::yield_now();
+                        crate::loom_wrapper::yield_now();
 
                         continue;
                     }

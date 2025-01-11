@@ -81,4 +81,4 @@ jobs:
           set -euxo pipefail
           cargo test --package chunnel --lib 
         env:
-          RUSTFLAGS: --cfg loom
+          RUSTFLAGS: --cfg loom -Dwarnings

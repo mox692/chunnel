@@ -29,13 +29,7 @@ permissions:
 jobs:
   test:
     name: test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - windows-latest
-          - ubuntu-latest
-          - macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -56,13 +50,7 @@ jobs:
 
   test-loom:
     name: test loom
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - windows-latest
-          - ubuntu-latest
-          - macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -82,3 +70,53 @@ jobs:
           cargo test --package chunnel --lib 
         env:
           RUSTFLAGS: --cfg loom -Dwarnings
+
+  miri:
+    name: miri
+    needs: basics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_miri_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_miri_nightly }}
+          components: miri
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: miri
+        run: |
+          cargo miri nextest run --lib --tests --no-fail-fast
+        env:
+          MIRIFLAGS: Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
+
+  miri-loom:
+    name: miri
+    needs: basics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_miri_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_miri_nightly }}
+          components: miri
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: miri
+        run: |
+          cargo miri nextest run --lib --tests --no-fail-fast
+        env:
+          MIRIFLAGS: Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
+      - name: miri loom
+        run: |
+          cargo miri nextest run --lib --tests --no-fail-fast
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
+          RUSTFLAGS: --cfg loom

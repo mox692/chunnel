@@ -93,7 +93,7 @@ jobs:
           MIRIFLAGS: Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
 
   miri-loom:
-    name: miri
+    name: miri-loom
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,11 +107,6 @@ jobs:
         with:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
-      - name: miri
-        run: |
-          cargo miri nextest run --lib --tests --no-fail-fast
-        env:
-          MIRIFLAGS: Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
       - name: miri loom
         run: |
           cargo miri nextest run --lib --tests --no-fail-fast

@@ -73,7 +73,6 @@ jobs:
 
   miri:
     name: miri
-    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,7 +94,6 @@ jobs:
 
   miri-loom:
     name: miri
-    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

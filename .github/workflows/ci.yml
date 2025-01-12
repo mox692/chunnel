@@ -90,7 +90,7 @@ jobs:
         run: |
           cargo miri nextest run --lib --tests --no-fail-fast
         env:
-          MIRIFLAGS: Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields"
 
   miri-loom:
     name: miri-loom
@@ -111,5 +111,5 @@ jobs:
         run: |
           cargo miri nextest run --lib --tests --no-fail-fast
         env:
-          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields"
           RUSTFLAGS: --cfg loom

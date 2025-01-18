@@ -9,8 +9,10 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
+use std::pin::Pin;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering::SeqCst;
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 
 ///  rx                   tx
 ///   |                   |
@@ -36,10 +38,17 @@ struct Inner<T, const N: usize> {
     rx_count: AtomicUsize,
 
     /// Wait list of `Tx`
-    tx_wakers: Mutex<VecDeque<Waker>>,
+    // tx_wakers: Mutex<VecDeque<Waker>>,
 
     /// Wait list of `Rx`
     rx_wakers: Mutex<VecDeque<Waker>>,
+
+    tx_waker_linked_list_handle: Mutex<LinkedListHandle<WaitNode>>,
+}
+
+struct LinkedListHandle<NodeType> {
+    head: Option<NonNull<NodeType>>,
+    tail: Option<NonNull<NodeType>>,
 }
 
 struct Bucket<T> {
@@ -226,8 +235,12 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),
         rx_count: AtomicUsize::new(1),
-        tx_wakers: Mutex::new(VecDeque::new()),
+        // tx_wakers: Mutex::new(VecDeque::new()),
         rx_wakers: Mutex::new(VecDeque::new()),
+        tx_waker_linked_list_handle: Mutex::new(LinkedListHandle {
+            head: None,
+            tail: None,
+        }),
     });
 
     let tx = Tx {
@@ -282,23 +295,48 @@ pub struct Rx<T, const N: usize> {
 struct TxRef<'a, T, const N: usize> {
     inner: &'a Tx<T, N>,
     val: Option<T>,
+    wait_node: WaitNode,
+}
+
+/// Actual linked-list node
+struct WaitNode {
+    next: Option<NonNull<Self>>,
+    waker: Option<Waker>,
     _p: PhantomPinned,
 }
 
 impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
     type Output = Result<(), TxError>;
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         {
             let res = self.inner.inner.start_send();
             match res {
                 Err(TxError::Full) => {
                     let waker = cx.waker().clone();
-                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-                    guard.push_back(waker);
-                    drop(guard);
+
+                    // construct linked list node
+                    // SAFETY: `TxRef` is !Unpin, so it should not be moved.
+                    let this = unsafe { self.get_unchecked_mut() };
+                    this.wait_node.waker = Some(waker);
+                    let node = &mut this.wait_node;
+
+                    let mut linked_list_guard =
+                        this.inner.inner.tx_waker_linked_list_handle.lock().unwrap();
+
+                    if linked_list_guard.tail.is_some() {
+                        unsafe {
+                            linked_list_guard.tail.unwrap().as_mut().next =
+                                Some(NonNull::new_unchecked(node))
+                        }
+                    } else {
+                        assert!(linked_list_guard.head.is_none());
+
+                        linked_list_guard.head = unsafe { Some(NonNull::new_unchecked(node)) };
+                        linked_list_guard.tail = linked_list_guard.head;
+                    }
+
+                    drop(linked_list_guard);
+
                     return Poll::Pending;
                 }
                 Err(TxError::Closed) => return Poll::Ready(Err(TxError::Closed)),
@@ -371,10 +409,13 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     self.inner.inner.bucket[pos].stamp.store(next, SeqCst);
 
                     // If there is a waiting `Tx` task, then wake it up
-                    let mut guard = self.inner.inner.tx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
+                    let mut guard = self.inner.inner.tx_waker_linked_list_handle.lock().unwrap();
+                    if guard.head.is_some() {
+                        let mut node = guard.head.take().unwrap();
+                        let waker = unsafe { node.as_mut().waker.take().unwrap() };
                         waker.wake();
+                        let next = unsafe { node.as_mut().next };
+                        guard.head = next;
                     }
                     drop(guard);
 
@@ -392,7 +433,11 @@ impl<T, const N: usize> Tx<T, N> {
         let fut = TxRef {
             inner: self,
             val: Some(v),
-            _p: PhantomPinned,
+            wait_node: WaitNode {
+                next: None,
+                waker: None,
+                _p: PhantomPinned,
+            },
         };
 
         // `TxRef` is pinned here
@@ -447,12 +492,16 @@ impl<T, const N: usize> Rx<T, N> {
                 self.inner.bucket[pos].stamp.store(next, SeqCst);
 
                 // If there is a waiting `Tx` task, then wake it up
-                let mut guard = self.inner.tx_wakers.lock().unwrap();
-                if guard.front().is_some() {
-                    let waker = guard.pop_front().unwrap();
+                let mut tx_linked_list_guard =
+                    self.inner.tx_waker_linked_list_handle.lock().unwrap();
+
+                if tx_linked_list_guard.head.is_some() {
+                    let mut node = tx_linked_list_guard.head.take().unwrap();
+                    let waker = unsafe { node.as_mut().waker.take().unwrap() };
                     waker.wake();
+                    let next = unsafe { node.as_mut().next };
+                    tx_linked_list_guard.head = next;
                 }
-                drop(guard);
 
                 Ok(res)
             }
@@ -657,6 +706,31 @@ mod loom_test {
             assert_eq!(rx.try_recv(), Ok(1));
             assert_ready_ok!(task.poll());
             assert_eq!(rx.try_recv(), Ok(2));
+        });
+    }
+
+    #[test]
+    fn send_wake_up_2() {
+        loom::model(|| {
+            let (tx, rx) = bounded::<i32, 1>();
+
+            let jh = loom::thread::spawn(move || {
+                loom::future::block_on(async {
+                    println!("a");
+                    let v = rx.recv().await.unwrap();
+
+                    assert_eq!(v, 1);
+                });
+            });
+
+            loom::future::block_on(async {
+                println!("b");
+                tx.send(1).await.unwrap();
+                println!("c");
+                // tx.send(2).await.unwrap();
+            });
+
+            jh.join().unwrap()
         });
     }
 

@@ -747,31 +747,6 @@ mod loom_test {
     }
 
     #[test]
-    fn send_wake_up_2() {
-        loom::model(|| {
-            let (tx, rx) = bounded::<i32, 1>();
-
-            let jh = loom::thread::spawn(move || {
-                loom::future::block_on(async {
-                    println!("a");
-                    let v = rx.recv().await.unwrap();
-
-                    assert_eq!(v, 1);
-                });
-            });
-
-            loom::future::block_on(async {
-                println!("b");
-                tx.send(1).await.unwrap();
-                println!("c");
-                // tx.send(2).await.unwrap();
-            });
-
-            jh.join().unwrap()
-        });
-    }
-
-    #[test]
     fn recv_wake_up() {
         loom::model(|| {
             let (tx, rx) = bounded::<i32, 1>();

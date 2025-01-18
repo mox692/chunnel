@@ -1,5 +1,6 @@
 //! Array based bounded async mpmc channel.
 
+use crate::linked_list::{LinkedListHandle, LinkedListNode};
 /// Optimization ideas:
 /// · batch insert / delete
 /// · use lock-free linked list for the waiter
@@ -41,11 +42,6 @@ struct Inner<T, const N: usize> {
 
     /// Wait list of `Tx`
     tx_waker_linked_list_handle: Mutex<LinkedListHandle<WaitNode>>,
-}
-
-struct LinkedListHandle<NodeType> {
-    head: Option<NonNull<NodeType>>,
-    tail: Option<NonNull<NodeType>>,
 }
 
 struct Bucket<T> {
@@ -232,14 +228,8 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),
         rx_count: AtomicUsize::new(1),
-        rx_waker_linked_list_handle: Mutex::new(LinkedListHandle {
-            head: None,
-            tail: None,
-        }),
-        tx_waker_linked_list_handle: Mutex::new(LinkedListHandle {
-            head: None,
-            tail: None,
-        }),
+        rx_waker_linked_list_handle: Mutex::new(LinkedListHandle::new()),
+        tx_waker_linked_list_handle: Mutex::new(LinkedListHandle::new()),
     });
 
     let tx = Tx {
@@ -307,6 +297,12 @@ struct WaitNode {
     _p: PhantomPinned,
 }
 
+impl LinkedListNode for WaitNode {
+    fn next(&mut self) -> &mut Option<NonNull<Self>> {
+        &mut self.next
+    }
+}
+
 impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
     type Output = Result<(), TxError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -325,17 +321,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     let mut linked_list_guard =
                         this.inner.inner.tx_waker_linked_list_handle.lock().unwrap();
 
-                    if linked_list_guard.tail.is_some() {
-                        unsafe {
-                            linked_list_guard.tail.unwrap().as_mut().next =
-                                Some(NonNull::new_unchecked(node))
-                        }
-                    } else {
-                        assert!(linked_list_guard.head.is_none());
-
-                        linked_list_guard.head = unsafe { Some(NonNull::new_unchecked(node)) };
-                        linked_list_guard.tail = linked_list_guard.head;
-                    }
+                    linked_list_guard.push_back(node);
 
                     drop(linked_list_guard);
 
@@ -355,26 +341,10 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     this.inner.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
                     let mut guard = this.inner.inner.rx_waker_linked_list_handle.lock().unwrap();
-                    if guard.head.is_some() {
-                        if guard.tail.is_some() {
-                            if guard.tail.unwrap().as_ptr() == guard.head.unwrap().as_ptr() {
-                                // only one element
-                                let mut cur_head = guard.head.take().unwrap();
-                                let waker = unsafe { cur_head.as_mut().waker.take().unwrap() };
-                                waker.wake();
-                                guard.head = None;
-                                guard.tail = None;
-                            } else {
-                                let mut cur_head = guard.head.take().unwrap();
-                                let waker = unsafe { cur_head.as_mut().waker.take().unwrap() };
-                                waker.wake();
-                                let next = unsafe { cur_head.as_mut().next };
-                                guard.head = next;
-                            }
-                        } else {
-                            panic!("This should not happen!!")
-                        }
+                    if let Some(node) = guard.pop_front() {
+                        node.waker.take().unwrap().wake();
                     }
+
                     drop(guard);
 
                     return Poll::Ready(Ok(()));
@@ -421,19 +391,10 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     let this = unsafe { self.get_unchecked_mut() };
                     this.wait_node.waker = Some(waker);
                     let node = &mut this.wait_node;
-
-                    let new_tail = unsafe { Some(NonNull::new_unchecked(node)) };
-
                     // If this RxRef has called `poll()` multiple times, `node.next` could have Some(node).
                     node.next = None;
-                    let cur_tail = linked_list_guard.tail;
-                    if cur_tail.is_some() {
-                        unsafe { cur_tail.unwrap().as_mut().next = new_tail };
-                        linked_list_guard.tail = new_tail;
-                    } else {
-                        linked_list_guard.head = new_tail;
-                        linked_list_guard.tail = new_tail;
-                    }
+
+                    linked_list_guard.push_back(node);
 
                     drop(linked_list_guard);
 
@@ -448,12 +409,9 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
 
                     // If there is a waiting `Tx` task, then wake it up
                     let mut guard = self.inner.inner.tx_waker_linked_list_handle.lock().unwrap();
-                    if guard.head.is_some() {
-                        let mut node = guard.head.take().unwrap();
-                        let waker = unsafe { node.as_mut().waker.take().unwrap() };
-                        waker.wake();
-                        let next = unsafe { node.as_mut().next };
-                        guard.head = next;
+
+                    if let Some(node) = guard.pop_front() {
+                        node.waker.take().unwrap().wake();
                     }
                     drop(guard);
 
@@ -497,12 +455,8 @@ impl<T, const N: usize> Tx<T, N> {
                 let mut rx_linked_list_guard =
                     self.inner.rx_waker_linked_list_handle.lock().unwrap();
 
-                if rx_linked_list_guard.head.is_some() {
-                    let mut node = rx_linked_list_guard.head.take().unwrap();
-                    let waker = unsafe { node.as_mut().waker.take().unwrap() };
-                    waker.wake();
-                    let next = unsafe { node.as_mut().next };
-                    rx_linked_list_guard.head = next;
+                if let Some(node) = rx_linked_list_guard.pop_front() {
+                    node.waker.take().unwrap().wake();
                 }
                 drop(rx_linked_list_guard);
 
@@ -545,12 +499,8 @@ impl<T, const N: usize> Rx<T, N> {
                 let mut tx_linked_list_guard =
                     self.inner.tx_waker_linked_list_handle.lock().unwrap();
 
-                if tx_linked_list_guard.head.is_some() {
-                    let mut node = tx_linked_list_guard.head.take().unwrap();
-                    let waker = unsafe { node.as_mut().waker.take().unwrap() };
-                    waker.wake();
-                    let next = unsafe { node.as_mut().next };
-                    tx_linked_list_guard.head = next;
+                if let Some(node) = tx_linked_list_guard.pop_front() {
+                    node.waker.take().unwrap().wake();
                 }
 
                 Ok(res)

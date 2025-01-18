@@ -403,16 +403,15 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     this.wait_node.waker = Some(waker);
                     let node = &mut this.wait_node;
 
+                    let new_tail = unsafe { Some(NonNull::new_unchecked(node)) };
                     if linked_list_guard.tail.is_some() {
-                        unsafe {
-                            linked_list_guard.tail.unwrap().as_mut().next =
-                                Some(NonNull::new_unchecked(node))
-                        }
+                        unsafe { linked_list_guard.tail.unwrap().as_mut().next = new_tail }
+                        linked_list_guard.tail = new_tail;
                     } else {
                         assert!(linked_list_guard.head.is_none());
 
-                        linked_list_guard.head = unsafe { Some(NonNull::new_unchecked(node)) };
-                        linked_list_guard.tail = linked_list_guard.head;
+                        linked_list_guard.head = new_tail;
+                        linked_list_guard.tail = new_tail;
                     }
 
                     drop(linked_list_guard);
@@ -484,6 +483,7 @@ impl<T, const N: usize> Tx<T, N> {
                     let next = unsafe { node.as_mut().next };
                     rx_linked_list_guard.head = next;
                 }
+                drop(rx_linked_list_guard);
 
                 return Ok(());
             }

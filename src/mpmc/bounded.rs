@@ -5,7 +5,6 @@
 /// · use lock-free linked list for the waiter
 /// · fast-path, slow-path
 use crate::loom_wrapper::{Arc, AtomicUsize, Mutex, UnsafeCell};
-use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
@@ -41,7 +40,7 @@ struct Inner<T, const N: usize> {
     // tx_wakers: Mutex<VecDeque<Waker>>,
 
     /// Wait list of `Rx`
-    rx_wakers: Mutex<VecDeque<Waker>>,
+    rx_waker_linked_list_handle: Mutex<LinkedListHandle<WaitNode>>,
 
     tx_waker_linked_list_handle: Mutex<LinkedListHandle<WaitNode>>,
 }
@@ -235,8 +234,10 @@ pub fn bounded<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
         tail: AtomicUsize::new(0),
         tx_count: AtomicUsize::new(1),
         rx_count: AtomicUsize::new(1),
-        // tx_wakers: Mutex::new(VecDeque::new()),
-        rx_wakers: Mutex::new(VecDeque::new()),
+        rx_waker_linked_list_handle: Mutex::new(LinkedListHandle {
+            head: None,
+            tail: None,
+        }),
         tx_waker_linked_list_handle: Mutex::new(LinkedListHandle {
             head: None,
             tail: None,
@@ -352,10 +353,19 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     // written value `v`.
                     this.inner.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
-                    let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
-                    if guard.front().is_some() {
-                        let waker = guard.pop_front().unwrap();
+                    // let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
+                    // if guard.front().is_some() {
+                    //     let waker = guard.pop_front().unwrap();
+                    //     waker.wake();
+                    // }
+                    // drop(guard);
+                    let mut guard = this.inner.inner.rx_waker_linked_list_handle.lock().unwrap();
+                    if guard.head.is_some() {
+                        let mut node = guard.head.take().unwrap();
+                        let waker = unsafe { node.as_mut().waker.take().unwrap() };
                         waker.wake();
+                        let next = unsafe { node.as_mut().next };
+                        guard.head = next;
                     }
                     drop(guard);
 
@@ -369,6 +379,7 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
 /// This struct is `Unpin`
 struct RxRef<'a, T, const N: usize> {
     inner: &'a Rx<T, N>,
+    wait_node: WaitNode,
 }
 
 impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
@@ -379,14 +390,14 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                 Err(RxError::NoValueToRead) => {
                     let waker = cx.waker().clone();
 
-                    let mut guard = self.inner.inner.rx_wakers.lock().unwrap();
+                    let mut linked_list_guard =
+                        self.inner.inner.rx_waker_linked_list_handle.lock().unwrap();
 
                     // check if just inserted?
                     let cur_head = self.inner.inner.head.load(SeqCst);
                     let cur_tail = self.inner.inner.tail.load(SeqCst);
                     if cur_tail < cur_head {
-                        drop(guard);
-
+                        drop(linked_list_guard);
                         // This is required for loom tests, since in theory there are some scenarios where
                         // Tx's CAS succeeded but stamp has not yet updated. In those cases, a thread trying
                         // to read value by a Rx could run into infinite loop.
@@ -396,8 +407,23 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                         continue;
                     }
 
-                    guard.push_back(waker);
-                    drop(guard);
+                    let this = unsafe { self.get_unchecked_mut() };
+                    this.wait_node.waker = Some(waker);
+                    let node = &mut this.wait_node;
+
+                    if linked_list_guard.tail.is_some() {
+                        unsafe {
+                            linked_list_guard.tail.unwrap().as_mut().next =
+                                Some(NonNull::new_unchecked(node))
+                        }
+                    } else {
+                        assert!(linked_list_guard.head.is_none());
+
+                        linked_list_guard.head = unsafe { Some(NonNull::new_unchecked(node)) };
+                        linked_list_guard.tail = linked_list_guard.head;
+                    }
+
+                    drop(linked_list_guard);
 
                     return Poll::Pending;
                 }
@@ -456,12 +482,16 @@ impl<T, const N: usize> Tx<T, N> {
                 self.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
                 // // If there is a waiting `Rx` task, then wake it up
-                let mut guard = self.inner.rx_wakers.lock().unwrap();
-                if guard.front().is_some() {
-                    let waker = guard.pop_front().unwrap();
+                let mut rx_linked_list_guard =
+                    self.inner.rx_waker_linked_list_handle.lock().unwrap();
+
+                if rx_linked_list_guard.head.is_some() {
+                    let mut node = rx_linked_list_guard.head.take().unwrap();
+                    let waker = unsafe { node.as_mut().waker.take().unwrap() };
                     waker.wake();
+                    let next = unsafe { node.as_mut().next };
+                    rx_linked_list_guard.head = next;
                 }
-                drop(guard);
 
                 return Ok(());
             }
@@ -471,7 +501,14 @@ impl<T, const N: usize> Tx<T, N> {
 
 impl<T, const N: usize> Rx<T, N> {
     pub async fn recv(&self) -> Result<T, RxError> {
-        let rx_ref = RxRef { inner: self };
+        let rx_ref = RxRef {
+            inner: self,
+            wait_node: WaitNode {
+                next: None,
+                waker: None,
+                _p: PhantomPinned,
+            },
+        };
         rx_ref.await
     }
 

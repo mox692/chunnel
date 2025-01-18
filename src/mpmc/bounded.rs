@@ -297,6 +297,9 @@ struct TxRef<'a, T, const N: usize> {
     wait_node: WaitNode,
 }
 
+/// SAFETY: It's fine for another thread to take an ownership of `TxRef`.
+unsafe impl<'a, T, const N: usize> Send for TxRef<'a, T, N> {}
+
 /// Actual linked-list node
 struct WaitNode {
     next: Option<NonNull<Self>>,
@@ -386,6 +389,9 @@ struct RxRef<'a, T, const N: usize> {
     inner: &'a Rx<T, N>,
     wait_node: WaitNode,
 }
+
+/// SAFETY: It's fine for another thread to take an ownership of `RxRef`.
+unsafe impl<'a, T, const N: usize> Send for RxRef<'a, T, N> {}
 
 impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
     type Output = Result<T, RxError>;

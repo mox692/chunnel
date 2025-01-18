@@ -353,11 +353,24 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
 
                     let mut guard = this.inner.inner.rx_waker_linked_list_handle.lock().unwrap();
                     if guard.head.is_some() {
-                        let mut node = guard.head.take().unwrap();
-                        let waker = unsafe { node.as_mut().waker.take().unwrap() };
-                        waker.wake();
-                        let next = unsafe { node.as_mut().next };
-                        guard.head = next;
+                        if guard.tail.is_some() {
+                            if guard.tail.unwrap().as_ptr() == guard.head.unwrap().as_ptr() {
+                                // only one element
+                                let mut cur_head = guard.head.take().unwrap();
+                                let waker = unsafe { cur_head.as_mut().waker.take().unwrap() };
+                                waker.wake();
+                                guard.head = None;
+                                guard.tail = None;
+                            } else {
+                                let mut cur_head = guard.head.take().unwrap();
+                                let waker = unsafe { cur_head.as_mut().waker.take().unwrap() };
+                                waker.wake();
+                                let next = unsafe { cur_head.as_mut().next };
+                                guard.head = next;
+                            }
+                        } else {
+                            panic!("This should not happen!!")
+                        }
                     }
                     drop(guard);
 
@@ -404,12 +417,14 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     let node = &mut this.wait_node;
 
                     let new_tail = unsafe { Some(NonNull::new_unchecked(node)) };
-                    if linked_list_guard.tail.is_some() {
-                        unsafe { linked_list_guard.tail.unwrap().as_mut().next = new_tail }
+
+                    // If this RxRef has called `poll()` multiple times, `node.next` could have Some(node).
+                    node.next = None;
+                    let cur_tail = linked_list_guard.tail;
+                    if cur_tail.is_some() {
+                        unsafe { cur_tail.unwrap().as_mut().next = new_tail };
                         linked_list_guard.tail = new_tail;
                     } else {
-                        assert!(linked_list_guard.head.is_none());
-
                         linked_list_guard.head = new_tail;
                         linked_list_guard.tail = new_tail;
                     }

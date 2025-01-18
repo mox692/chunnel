@@ -36,12 +36,10 @@ struct Inner<T, const N: usize> {
     /// The number of Rx
     rx_count: AtomicUsize,
 
-    /// Wait list of `Tx`
-    // tx_wakers: Mutex<VecDeque<Waker>>,
-
     /// Wait list of `Rx`
     rx_waker_linked_list_handle: Mutex<LinkedListHandle<WaitNode>>,
 
+    /// Wait list of `Tx`
     tx_waker_linked_list_handle: Mutex<LinkedListHandle<WaitNode>>,
 }
 
@@ -353,12 +351,6 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                     // written value `v`.
                     this.inner.inner.bucket[pos].stamp.fetch_add(1, SeqCst);
 
-                    // let mut guard = this.inner.inner.rx_wakers.lock().unwrap();
-                    // if guard.front().is_some() {
-                    //     let waker = guard.pop_front().unwrap();
-                    //     waker.wake();
-                    // }
-                    // drop(guard);
                     let mut guard = this.inner.inner.rx_waker_linked_list_handle.lock().unwrap();
                     if guard.head.is_some() {
                         let mut node = guard.head.take().unwrap();

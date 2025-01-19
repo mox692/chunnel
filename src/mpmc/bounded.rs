@@ -312,7 +312,6 @@ impl<'a, T, const N: usize> Future for TxRef<'a, T, N> {
                 Err(TxError::Full) => {
                     let waker = cx.waker().clone();
 
-                    // construct linked list node
                     // SAFETY: `TxRef` is !Unpin, so it should not be moved.
                     let this = unsafe { self.get_unchecked_mut() };
                     this.wait_node.waker = Some(waker);
@@ -375,6 +374,7 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                         self.inner.inner.rx_waker_linked_list_handle.lock().unwrap();
 
                     // check if just inserted?
+                    // TODO: This check
                     let cur_head = self.inner.inner.head.load(SeqCst);
                     let cur_tail = self.inner.inner.tail.load(SeqCst);
                     if cur_tail < cur_head {
@@ -391,7 +391,7 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
                     let this = unsafe { self.get_unchecked_mut() };
                     this.wait_node.waker = Some(waker);
                     let node = &mut this.wait_node;
-                    // If this RxRef has called `poll()` multiple times, `node.next` could have Some(node).
+                    // If this RxRef has called `poll()` multiple times, `node.next` could have `Some(node)`.
                     node.next = None;
 
                     linked_list_guard.push_back(node);
@@ -409,7 +409,6 @@ impl<'a, T, const N: usize> Future for RxRef<'a, T, N> {
 
                     // If there is a waiting `Tx` task, then wake it up
                     let mut guard = self.inner.inner.tx_waker_linked_list_handle.lock().unwrap();
-
                     if let Some(node) = guard.pop_front() {
                         node.waker.take().unwrap().wake();
                     }

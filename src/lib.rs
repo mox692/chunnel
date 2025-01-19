@@ -1,2 +1,3 @@
-pub mod loom_wrapper;
+pub(crate) mod linked_list;
+pub(crate) mod loom_wrapper;
 pub mod mpmc;
